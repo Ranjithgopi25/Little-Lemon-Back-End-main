@@ -1,1746 +1,2183 @@
-import { Injectable, inject } from '@angular/core';
-import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
-import { BehaviorSubject, Observable, Subject, firstValueFrom } from 'rxjs';
-import { Message, EditWorkflowMetadata, ParagraphEdit, EditorialFeedbackItem } from '../models';
-import { ChatService } from './chat.service';
-import { normalizeEditorOrder, normalizeContent, extractDocumentTitle, getEditorDisplayName, formatMarkdown, convertMarkdownToHtml, extractFileText } from '../utils/edit-content.utils';
-import { 
-  splitIntoParagraphs, 
-  createParagraphEditsFromComparison, 
-  allParagraphsDecided,
-  validateStringEquality
-} from '../utils/paragraph-edit.utils';
+<div
+  class="app-container"
+  [class.sidebar-expanded]="sidebarExpanded"
+  >
+  <!-- Top Header Bar -->
+  <header class="top-header">
+    <div class="header-left">
+      <img
+        src="assets/images/pwc-logo-2025.png"
+        alt="PwC"
+        class="pwc-header-logo"
+        />
+        <span class="mcx-ai-text"></span>
+        <button
+          class="menu-toggle"
+          (click)="toggleMobileMenu()"
+          type="button"
+          aria-label="Toggle menu"
+          >
+          <svg
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            >
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+      </div>
 
-export type EditWorkflowStep = 'idle' | 'awaiting_editors' | 'awaiting_content' | 'processing' | 'awaiting_approval';
-
-export interface EditWorkflowState {
-  step: EditWorkflowStep;
-  uploadedFile: File | null;
-  selectedEditors: string[];
-  originalContent: string;
-  paragraphEdits: ParagraphEdit[];
-}
-
-export interface EditWorkflowMessage {
-  type: 'prompt' | 'result' | 'update';
-  message: Message;
-  metadata?: any;
-}
-
-export interface EditorOption {
-  id: string;
-  name: string;
-  icon: string;
-  description: string;
-  selected: boolean;
-  disabled?: boolean;
-  alwaysSelected?: boolean;
-}
-
-@Injectable({
-  providedIn: 'root'
-})
-export class ChatEditWorkflowService {
-  private chatService = inject(ChatService);
-  private sanitizer = inject(DomSanitizer);
-
-  private stateSubject = new BehaviorSubject<EditWorkflowState>({
-    step: 'idle',
-    uploadedFile: null,
-    selectedEditors: ['brand-alignment'],
-    originalContent: '',
-    paragraphEdits: []
-  });
-
-  public state$: Observable<EditWorkflowState> = this.stateSubject.asObservable();
-
-  private messageSubject = new Subject<EditWorkflowMessage>();
-  public message$: Observable<EditWorkflowMessage> = this.messageSubject.asObservable();
-
-  private workflowCompletedSubject = new Subject<void>();
-  public workflowCompleted$: Observable<void> = this.workflowCompletedSubject.asObservable();
-
-  private workflowStartedSubject = new Subject<void>();
-  public workflowStarted$: Observable<void> = this.workflowStartedSubject.asObservable();
-
-  // Track final article generation state
-  private isGeneratingFinalSubject = new BehaviorSubject<boolean>(false);
-  public isGeneratingFinal$: Observable<boolean> = this.isGeneratingFinalSubject.asObservable();
-  public get isGeneratingFinal(): boolean {
-    return this.isGeneratingFinalSubject.value;
-  }
-
-  // Sequential workflow properties
-  private threadId: string | null = null;
-  private currentEditor: string | null = null;
-  private isSequentialMode: boolean = false;
-  private isLastEditor: boolean = false;
-  private currentEditorIndex: number = 0;
-  private totalEditors: number = 0;
-
-  // Getters for sequential workflow state
-  get sequentialThreadId(): string | null {
-    return this.threadId;
-  }
-
-  get sequentialMode(): boolean {
-    return this.isSequentialMode;
-  }
-
-  get sequentialIsLastEditor(): boolean {
-    return this.isLastEditor;
-  }
-
-  readonly editorOptions: EditorOption[] = [
-    { 
-      id: 'development', 
-      name: 'Development Editor', 
-      icon: '🚀', 
-      description: 'Reviews and restructures content for alignment and coherence',
-      selected: false
-    },
-    { 
-      id: 'content', 
-      name: 'Content Editor', 
-      icon: '📄', 
-      description: "Refines language to align with the author's objectives",
-      selected: false
-    },
-    { 
-      id: 'line', 
-      name: 'Line Editor', 
-      icon: '📝', 
-      description: 'Improves sentence flow, readability and style preserving voice',
-      selected: false
-    },
-    { 
-      id: 'copy', 
-      name: 'Copy Editor', 
-      icon: '✏️', 
-      description: 'Corrects grammar, punctuation and typos',
-      selected: false
-    },
-    { 
-      id: 'brand-alignment', 
-      name: 'PwC Brand Alignment Editor', 
-      icon: '🎯', 
-      description: 'Aligns content writing standards with PwC brand',
-      selected: true
-    }
-  ];
-
-  get currentState(): EditWorkflowState {
-    return this.stateSubject.value;
-  }
-
-  get isActive(): boolean {
-    return this.currentState.step !== 'idle';
-  }
-
-  /** Detect edit intent using LLM agent via backend API */
-  async detectEditIntent(input: string): Promise<{hasEditIntent: boolean, detectedEditors?: string[]}> {
-    if (!input || !input.trim()) {
-      return { hasEditIntent: false };
-    }
-
-    try {
-      const result = await firstValueFrom(
-        this.chatService.detectEditIntent(input.trim())
-      );
-      
-      const hasEditIntent = result.is_edit_intent && result.confidence >= 0.7;
-      const detectedEditors = result.detected_editors && result.detected_editors.length > 0 
-        ? result.detected_editors 
-        : undefined;
-      
-      return { 
-        hasEditIntent, 
-        detectedEditors 
-      };
-    } catch (error) {
-      console.error('Error in LLM intent detection:', error);
-      return { hasEditIntent: false };
-    }
-  }
-
-  beginWorkflow(): void {
-    const defaultState = this.getDefaultState();
-    this.updateState({
-      ...defaultState,
-      step: 'awaiting_editors'
-    });
-
-    // Emit workflow started event to clear previous state
-    this.workflowStartedSubject.next();
-
-    const promptMessage = this.createEditorSelectionMessage(
-      `I'll help you edit your content! 📝\n\n**Select the editing services you'd like to use:**`
-    );
-
-    this.messageSubject.next({
-      type: 'prompt',
-      message: promptMessage
-    });
-  }
-
-  /** Begin workflow with pre-selected editors (Path 1: Direct Editor Detection) */
-  beginWorkflowWithEditors(editorIds: string[]): void {
-    if (!editorIds || editorIds.length === 0) {
-      this.beginWorkflow();
-      return;
-    }
-
-    const validEditorIds = this.editorOptions.map(e => e.id);
-    const validatedEditors = editorIds.filter(id => validEditorIds.includes(id));
-
-    if (validatedEditors.length === 0) {
-      this.beginWorkflow();
-      return;
-    }
-
-    const editorsWithBrand = [...validatedEditors];
-    if (!editorsWithBrand.includes('brand-alignment')) {
-      editorsWithBrand.push('brand-alignment');
-    }
-
-    const defaultState = this.getDefaultState();
-    this.updateState({
-      ...defaultState,
-      step: 'awaiting_content',
-      selectedEditors: editorsWithBrand
-    });
-
-    // Emit workflow started event to clear previous state
-    this.workflowStartedSubject.next();
-
-    const editorNamesText = this.getSelectedEditorNames(validatedEditors);
-
-    const editWorkflowMetadata: EditWorkflowMetadata = {
-      step: 'awaiting_content',
-      showFileUpload: true,
-      showCancelButton: false,
-      showSimpleCancelButton: true
-    };
-
-    const contentRequestMessage: Message = {
-      role: 'assistant',
-      content: `✅ **Using ${editorNamesText} to edit your content**\n\n**Now, please upload your document:**`,
-      timestamp: new Date(),
-      editWorkflow: editWorkflowMetadata
-    };
-
-    this.messageSubject.next({
-      type: 'prompt',
-      message: contentRequestMessage
-    });
-  }
-
-  /** Get editor names from editor IDs */
-  private getEditorNamesFromIds(editorIds: string[]): string[] {
-    return editorIds
-      .map(id => this.editorOptions.find(e => e.id === id)?.name)
-      .filter((name): name is string => !!name);
-  }
-
-  /** Get selected editor names as a formatted string */
-  private getSelectedEditorNames(editorIds: string[]): string {
-    const names = this.getEditorNamesFromIds(editorIds);
-    if (names.length === 0) {
-      return '';
-    }
-    if (names.length === 1) {
-      return names[0];
-    }
-    if (names.length === 2) {
-      return names.join(' and ');
-    }
-    return names.slice(0, -1).join(', ') + ', and ' + names[names.length - 1];
-  }
-
-  private getNumberedEditorList(editorOptions?: EditorOption[]): string {
-    const editors = editorOptions || this.editorOptions;
-    const currentSelectedIds = this.currentState.selectedEditors;
-    
-    return editors.map((editor, index) => {
-      const num = index + 1;
-      const isSelected = currentSelectedIds.includes(editor.id);
-      const selected = isSelected ? ' ✓' : '';
-      return `${num}. **${editor.name}** — ${editor.description}${selected}`;
-    }).join('\n');
-  }
-
-  handleFileUpload(file: File): void {
-    if (this.currentState.step !== 'awaiting_content') {
-      return;
-    }
-
-    this.updateState({
-      ...this.currentState,
-      uploadedFile: file
-    });
-    
-    this.processWithContent();
-  }
-
-  async handleChatInput(input: string, file?: File): Promise<void> {
-    const trimmedInput = input.trim();
-    const workflowActive = this.isActive;
-
-    if (!workflowActive) {
-      const intentResult = await this.detectEditIntent(trimmedInput);
-      if (intentResult.hasEditIntent) {
-        // Path 1: Direct Editor Detection - editors detected
-        if (intentResult.detectedEditors && intentResult.detectedEditors.length > 0) {
-          this.beginWorkflowWithEditors(intentResult.detectedEditors);
-        } else {
-          // Path 2: Standard Flow - show editor selection
-          this.beginWorkflow();
-        }
-      return;
-      }
-    }
-
-    if (!workflowActive) {
-      return;
-    }
-
-    if (this.currentState.step === 'awaiting_editors') {
-      if (trimmedInput) {
-        const lowerInput = trimmedInput.toLowerCase();
-        if (lowerInput.includes('proceed') || lowerInput.includes('continue') || lowerInput.includes('yes') || lowerInput === 'ok' || lowerInput === 'done') {
-          this.proceedToContentStep();
-          return;
-        }
-        
-        if (lowerInput.includes('cancel')) {
-          this.cancelWorkflow();
-          return;
-        }
-        
-        const selectionResult = this.parseNumericSelection(trimmedInput);
-        if (selectionResult.selectedIndices.length > 0 || selectionResult.hasInput) {
-          this.handleNumericSelection(selectionResult);
-          return;
-        }
-        
-        if (trimmedInput.trim().length > 0) {
-          this.showInvalidSelectionError();
-          return;
-        }
-      }
-      return;
-    }
-
-    if (this.currentState.step === 'awaiting_content') {
-      if (file) {
-        this.handleFileUpload(file);
-        return;
-      }
-      
-      if (trimmedInput) {
-        const errorMessage: Message = {
-          role: 'assistant',
-          content: '⚠️ **Please upload a document file** (Word, PDF, Text, or Markdown). Text pasting is not available in this workflow.',
-          timestamp: new Date(),
-          editWorkflow: {
-            step: 'awaiting_content',
-            showCancelButton: false,
-            showSimpleCancelButton: true
-          }
-        };
-        this.messageSubject.next({ type: 'prompt', message: errorMessage });
-        return;
-      }
-    }
-  }
-
-  private parseNumericSelection(input: string): { selectedIndices: number[], invalidIndices: number[], hasInput: boolean } {
-    const selectedIndices: number[] = [];
-    const invalidIndices: number[] = [];
-    let hasInput = false;
-    
-    const cleanedInput = input.replace(/(?:select|choose|pick|use|want|need|editor|editors)/gi, '').trim();
-    
-    if (!/\d/.test(cleanedInput)) {
-      return { selectedIndices: [], invalidIndices: [], hasInput: cleanedInput.length > 0 };
-    }
-    
-    hasInput = true;
-    const parts = cleanedInput.split(/[,;\s]+/).filter(part => part.trim().length > 0);
-    
-    for (const part of parts) {
-      const trimmedPart = part.trim();
-      if (!trimmedPart) continue;
-      
-      const rangeMatch = trimmedPart.match(/^(\d+)\s*-\s*(\d+)$/);
-      if (rangeMatch) {
-        const start = parseInt(rangeMatch[1]);
-        const end = parseInt(rangeMatch[2]);
-        
-        if (start > end) {
-          continue;
-        }
-        
-        for (let i = start; i <= end; i++) {
-          if (i >= 1 && i <= 5) {
-            if (!selectedIndices.includes(i)) {
-              selectedIndices.push(i);
+      <div class="llm-container">
+        <div class="llm-selector-container">
+          <!-- Service Provider Dropdown -->
+          <div class="dropdown-wrapper">
+            <button
+              class="dropdown-btn"
+              (click)="toggleDropdown('service-provider', $event)"
+              type="button"
+              title="Select Service Provider"
+              >
+              <span class="dropdown-label">{{ selectedServiceProvider === 'openai' ? 'OpenAI' : 'Anthropic' }}</span>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                [class.rotate]="openDropdown === 'service-provider'"
+                >
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </button>
+            @if (openDropdown === 'service-provider') {
+              <div
+                class="dropdown-menu"
+                (click)="$event.stopPropagation()"
+                >
+                <button
+                  class="dropdown-item"
+                  [class.active]="selectedServiceProvider === 'openai'"
+                  (click)="selectServiceProvider('openai', $event)"
+                  type="button"
+                  >
+                  OpenAI
+                </button>
+                <button
+                  class="dropdown-item"
+                  [class.active]="selectedServiceProvider === 'anthropic'"
+                  (click)="selectServiceProvider('anthropic', $event)"
+                  type="button"
+                  >
+                  Anthropic
+                </button>
+              </div>
             }
-          } else {
-            if (!invalidIndices.includes(i)) {
-              invalidIndices.push(i);
-            }
-          }
-        }
-        continue;
-      }
-      
-      const numberMatch = trimmedPart.match(/^(\d+)$/);
-      if (numberMatch) {
-        const num = parseInt(numberMatch[1]);
-        if (num >= 1 && num <= 5) {
-          if (!selectedIndices.includes(num)) {
-            selectedIndices.push(num);
-          }
-        } else {
-          if (!invalidIndices.includes(num)) {
-            invalidIndices.push(num);
-          }
-        }
-        continue;
-      }
-    }
-    
-    selectedIndices.sort((a, b) => a - b);
-    invalidIndices.sort((a, b) => a - b);
-    
-    return { selectedIndices, invalidIndices, hasInput };
-  }
+          </div>
 
-  private handleNumericSelection(result: { selectedIndices: number[], invalidIndices: number[], hasInput: boolean }): void {
-    if (result.invalidIndices.length > 0) {
-      const editorList = this.getNumberedEditorList();
-      const errorMessage = this.createEditorSelectionMessage(
-        `⚠️ **Invalid editor number(s):** ${result.invalidIndices.join(', ')}\n\n**Valid editor numbers are 1-5.**\n\n**Editor List:**\n\n${editorList}\n\nPlease provide valid editor numbers (1-5) or type "proceed" to continue with defaults.`
-      );
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-      return;
-    }
-    
-    if (result.selectedIndices.length === 0 && result.hasInput) {
-      this.showInvalidSelectionError();
-      return;
-    }
-    
-    if (result.selectedIndices.length > 0) {
-      const updatedEditors = this.editorOptions.map((editor, index) => {
-        const editorNum = index + 1;
-        return {
-          ...editor,
-          selected: result.selectedIndices.includes(editorNum)
-        };
-      });
-      
-      const selectedIds = updatedEditors.filter(e => e.selected).map(e => e.id);
-      
-      // Ensure brand-alignment is always included
-      if (!selectedIds.includes('brand-alignment')) {
-        selectedIds.push('brand-alignment');
-      }
-      
-      this.updateState({
-        ...this.currentState,
-        selectedEditors: selectedIds
-      });
-      
-      const selectedNames = updatedEditors
-        .filter(e => e.selected)
-        .map((e, idx) => {
-          const num = this.editorOptions.findIndex(opt => opt.id === e.id) + 1;
-          return `${num}. ${e.name}`;
-        })
-        .join(', ');
-      
-      const confirmMessage = this.createEditorSelectionMessage(
-        `✅ **Selected editors:** ${selectedNames}\n\nType "proceed" to continue or select different editors.`,
-        updatedEditors
-      );
-      
-      this.messageSubject.next({ type: 'prompt', message: confirmMessage });
-    }
-  }
-
-  private showInvalidSelectionError(): void {
-    const editorList = this.getNumberedEditorList();
-    const errorMessage = this.createEditorSelectionMessage(
-      `⚠️ **Please provide valid editor numbers (1-5).**\n\n**Editor List:**\n\n${editorList}\n\nOr type "proceed" to continue with defaults.`
-    );
-    this.messageSubject.next({ type: 'prompt', message: errorMessage });
-  }
-
-  private parseOptOutInput(input: string): { optedOut: number[], sections: string[] } {
-    const lowerInput = input.toLowerCase();
-    const optedOut: number[] = [];
-    const sections: string[] = [];
-    
-    const optOutPattern = /(?:remove|skip|exclude|without|opt\s*out|deselect|don't\s*use|do\s*not\s*use)\s+(\d+(?:\s*[,\s]?\s*(?:and\s*)?\d+)*)/gi;
-    
-    let match;
-    while ((match = optOutPattern.exec(lowerInput)) !== null) {
-      const numbersStr = match[1];
-      const numberMatches = numbersStr.match(/\d+/g);
-      if (numberMatches) {
-        numberMatches.forEach(numStr => {
-          const num = parseInt(numStr);
-          if (num >= 1 && num <= 5 && !optedOut.includes(num)) {
-            optedOut.push(num);
-          }
-        });
-      }
-    }
-    
-    const sectionPatterns = [
-      /(?:edit|review|focus\s*on)\s+(?:pages?|sections?)\s+(\d+(?:\s*-\s*\d+)?)/gi,
-      /(?:edit|review)\s+(?:the\s+)?(introduction|conclusion|summary|abstract|body|content)/gi
-    ];
-    
-    sectionPatterns.forEach(pattern => {
-      let match;
-      while ((match = pattern.exec(input)) !== null) {
-        if (match[1] && !sections.includes(match[1])) {
-          sections.push(match[1]);
-        }
-      }
-    });
-    
-    return { optedOut, sections };
-  }
-
-  private handleOptOutAndProceed(result: { optedOut: number[], sections: string[] }): void {
-    const currentEditors = [...this.editorOptions];
-    // Find brand-alignment editor index to prevent it from being opted out
-    const brandAlignmentIndex = currentEditors.findIndex(e => e.id === 'brand-alignment');
-    const brandAlignmentNum = brandAlignmentIndex >= 0 ? brandAlignmentIndex + 1 : -1;
-    
-    const selectedEditors = currentEditors.map((editor, index) => {
-      const editorNum = index + 1;
-      // Brand alignment is always selected, cannot be opted out
-      if (editor.id === 'brand-alignment') {
-        return {
-          ...editor,
-          selected: true
-        };
-      }
-      return {
-        ...editor,
-        selected: !result.optedOut.includes(editorNum)
-      };
-    });
-    
-    const selectedIds = selectedEditors.filter(e => e.selected).map(e => e.id);
-    
-    // Ensure brand-alignment is always included
-    if (!selectedIds.includes('brand-alignment')) {
-      selectedIds.push('brand-alignment');
-    }
-    
-    this.updateState({
-      ...this.currentState,
-      selectedEditors: selectedIds
-    });
-    
-    let responseMessage = '';
-    if (result.optedOut.length > 0) {
-      const optedOutNames = result.optedOut.map(num => {
-        const editor = this.editorOptions[num - 1];
-        return `${num}. ${editor.name}`;
-      }).join(', ');
-      responseMessage += `✅ **Opted out:** ${optedOutNames}\n\n`;
-    }
-    
-    if (result.sections.length > 0) {
-      responseMessage += `📄 **Sections to edit:** ${result.sections.join(', ')}\n\n`;
-    }
-    
-    const remainingEditors = selectedEditors.filter(e => e.selected);
-    if (remainingEditors.length === 0) {
-      responseMessage += `⚠️ **No editors selected.** Please keep at least one editor active.`;
-      const errorMessage = this.createEditorSelectionMessage(responseMessage, selectedEditors);
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-      return;
-    }
-    
-    responseMessage += `**Selected ${remainingEditors.length} editor${remainingEditors.length > 1 ? 's' : ''}:** ${remainingEditors.map(e => e.name).join(', ')}\n\nWhen you're ready, click "Continue" or type "proceed" to move to the next step.`;
-    
-    const confirmMessage = this.createEditorSelectionMessage(responseMessage, selectedEditors);
-    
-    this.messageSubject.next({
-      type: 'prompt',
-      message: confirmMessage
-    });
-  }
-
-  private proceedToContentStep(): void {
-    // Ensure brand-alignment is always included
-    const selectedIds = [...this.currentState.selectedEditors];
-    if (!selectedIds.includes('brand-alignment')) {
-      selectedIds.push('brand-alignment');
-    }
-    
-    if (selectedIds.length === 0) {
-      this.createNoEditorsErrorMessage();
-      return;
-    }
-    
-    // Update state to ensure brand-alignment is included
-    this.updateState({
-      ...this.currentState,
-      selectedEditors: selectedIds
-    });
-
-    this.updateState({
-      ...this.currentState,
-      step: 'awaiting_content'
-    });
-
-    const editorNamesText = this.getSelectedEditorNames(selectedIds);
-
-    const editWorkflowMetadata: EditWorkflowMetadata = {
-      step: 'awaiting_content',
-      showFileUpload: true,  // Show file upload component
-      showCancelButton: false,
-      showSimpleCancelButton: true
-    };
-
-    const contentRequestMessage: Message = {
-      role: 'assistant',
-      content: `✅ **Using ${editorNamesText} to edit your content**\n\n**Now, please upload your document:**`,
-      timestamp: new Date(),
-      editWorkflow: editWorkflowMetadata
-    };
-
-    this.messageSubject.next({
-      type: 'prompt',
-      message: contentRequestMessage
-    });
-  }
-
-  private async processWithContent(): Promise<void> {
-    // Ensure brand-alignment is always included
-    const selectedIds = [...this.currentState.selectedEditors];
-    if (!selectedIds.includes('brand-alignment')) {
-      selectedIds.push('brand-alignment');
-    }
-    const selectedNames = this.getSelectedEditorNames(selectedIds);
-
-    try {
-      let contentText = this.currentState.originalContent;
-      
-      if (this.currentState.uploadedFile && !contentText) {
-        contentText = await extractFileText(this.currentState.uploadedFile);
-        contentText = normalizeContent(contentText);
-        this.updateState({
-          ...this.currentState,
-          originalContent: contentText
-        });
-      }
-
-      if (!contentText || !contentText.trim()) {
-        throw new Error('No content to process');
-      }
-
-      this.updateState({
-        ...this.currentState,
-        step: 'processing'
-      });
-
-      const processingMessage: Message = {
-        role: 'assistant',
-        content: `Processing your content with: **${selectedNames}**\n\nPlease wait while I analyze and edit your content...`,
-        timestamp: new Date(),
-      editWorkflow: {
-        step: 'processing',
-        showCancelButton: false
-      }
-      };
-
-      this.messageSubject.next({
-        type: 'prompt',
-        message: processingMessage
-      });
-
-      await this.processContent(contentText, selectedIds, selectedNames);
-    } catch (error) {
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: 'Sorry, there was an error processing your content. Please try again.',
-        timestamp: new Date()
-      };
-      this.messageSubject.next({ type: 'result', message: errorMessage });
-      this.completeWorkflow();
-    }
-  }
-
-  handleEditorSelection(selectedIds: string[]): void {
-    if (this.currentState.step !== 'awaiting_editors') {
-      return;
-    }
-
-    // Ensure brand-alignment is always included
-    const editorsWithBrand = [...selectedIds];
-    if (!editorsWithBrand.includes('brand-alignment')) {
-      editorsWithBrand.push('brand-alignment');
-    }
-
-    if (editorsWithBrand.length === 0) {
-      this.createNoEditorsErrorMessage();
-      return;
-    }
-
-    this.updateState({
-      ...this.currentState,
-      selectedEditors: editorsWithBrand
-    });
-
-    this.proceedToContentStep();
-  }
-
-  private async processContent(contentText: string, selectedIds: string[], selectedNames: string): Promise<void> {
-    const messages = [{
-      role: 'user' as const,
-      content: contentText
-    }];
-
-    const normalizedEditorIds = normalizeEditorOrder(selectedIds);
-
-    let fullResponse = '';
-    let combinedFeedback = '';
-    let finalRevisedContent = '';
-    let currentEditorProgress: {current: number, total: number, currentEditor: string} | null = null;
-    let editorErrors: Array<{editor: string, error: string}> = [];
-    
-    const editorProgressList: Array<{editorId: string, editorName: string, status: 'pending' | 'processing' | 'completed' | 'error', current?: number, total?: number}> = normalizedEditorIds.map((id, index) => ({
-      editorId: id,
-      editorName: getEditorDisplayName(id),
-      status: 'pending' as const,
-      current: index + 1,
-      total: normalizedEditorIds.length
-    }));
-
-    // Use default temperature (0.15) - optimal for editing: allows minor improvements while staying deterministic
-    this.chatService.streamEditContent(messages, normalizedEditorIds).subscribe({
-      next: (data: any) => {
-        if (data.type === 'editor_progress') {
-          currentEditorProgress = {
-            current: data.current || 0,
-            total: data.total || 0,
-            currentEditor: data.editor || ''
-          };
-          
-          const currentIndex = data.current || 0;
-          editorProgressList.forEach((editor, index) => {
-            const editorIndex = index + 1;
-            if (editorIndex < currentIndex) {
-              editor.status = 'completed';
-            } else if (editorIndex === currentIndex) {
-              editor.status = 'processing';
-              editor.current = currentIndex;
-              editor.total = data.total || selectedIds.length;
-            } else {
-              editor.status = 'pending';
-            }
-          });
-          
-          const progressMessage: Message = {
-            role: 'assistant',
-            content: '',
-            timestamp: new Date(),
-            editWorkflow: {
-              step: 'processing',
-              showCancelButton: false,
-              editorProgress: currentEditorProgress || undefined,
-              editorProgressList: [...editorProgressList]
-            }
-          };
-          this.messageSubject.next({ type: 'prompt', message: progressMessage });
-        } else if (data.type === 'editor_content') {
-          if (data.content) {
-            fullResponse += data.content;
-          }
-        } else if (data.type === 'editor_complete') {
-          // Sequential workflow: Handle single editor completion
-          console.log('[ChatEditWorkflow] Editor complete:', data);
-          
-          // Store thread_id for sequential workflow
-          if (data.thread_id) {
-            this.threadId = data.thread_id;
-            this.isSequentialMode = true;
-          }
-          
-          // Store current editor info
-          if (data.current_editor) {
-            this.currentEditor = data.current_editor;
-            this.currentEditorIndex = data.editor_index || 0;
-            this.totalEditors = data.total_editors || this.totalEditors;
-            this.isLastEditor = (data.editor_index || 0) >= (data.total_editors || 1) - 1;
-          }
-          
-          const completedEditor = editorProgressList.find(e => e.editorId === data.current_editor || e.editorId === data.editor);
-          if (completedEditor) {
-            completedEditor.status = 'completed';
-          }
-          
-          // Process paragraph edits for sequential workflow (same as guided journey)
-          let paragraphEdits: ParagraphEdit[] = [];
-          if (data.paragraph_edits && Array.isArray(data.paragraph_edits)) {
-            const allEditorNames = selectedIds.map(editorId => {
-              return getEditorDisplayName(editorId);
-            });
-            
-            const originalContent = data.original_content || this.currentState.originalContent || '';
-            const originalParagraphs = originalContent ? splitIntoParagraphs(originalContent) : [];
-            
-            paragraphEdits = data.paragraph_edits.map((edit: any, arrayIndex: number) => {
-              const existingTags = edit.tags || [];
-              
-              const existingEditorNames = new Set<string>(
-                existingTags.map((tag: string) => {
-                  const match = tag.match(/^(.+?)\s*\(/);
-                  return match ? match[1].trim() : tag;
-                })
-              );
-              
-              const allTags = [...existingTags];
-              allEditorNames.forEach(editorName => {
-                const existingNamesArray = Array.from(existingEditorNames) as string[];
-                if (!existingNamesArray.some((existing: string) => 
-                  existing.toLowerCase().includes(editorName.toLowerCase()) || 
-                  editorName.toLowerCase().includes(existing.toLowerCase())
-                )) {
-                  allTags.push(`${editorName} (Reviewed)`);
+          <!-- Model Dropdown -->
+          <div class="dropdown-wrapper">
+            <button
+              class="dropdown-btn"
+              (click)="toggleDropdown('model-select', $event)"
+              type="button"
+              title="Select LLM Model"
+              >
+              <span class="dropdown-label">{{ selectedModel }}</span>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                [class.rotate]="openDropdown === 'model-select'"
+                >
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </button>
+            @if (openDropdown === 'model-select') {
+              <div
+                class="dropdown-menu"
+                (click)="$event.stopPropagation()"
+                >
+                @for (model of availableModels; track model) {
+                  <button
+                    class="dropdown-item"
+                    [class.active]="selectedModel === model"
+                    (click)="selectModel(model, $event)"
+                    type="button"
+                    >
+                    {{ model }}
+                  </button>
                 }
-              });
-              
-              const paragraphIndex = (edit.index !== undefined && edit.index !== null) ? edit.index : arrayIndex;
-              const originalText = (edit.original && edit.original.trim()) || (originalParagraphs.length > paragraphIndex && paragraphIndex >= 0 ? (originalParagraphs[paragraphIndex] && originalParagraphs[paragraphIndex].trim()) || '' : '');
-              const editedText = (edit.edited && edit.edited.trim()) || '';
-              const isIdentical = validateStringEquality(originalText, editedText);
-              const autoApproved = edit.autoApproved !== undefined ? edit.autoApproved : isIdentical;
-              const approved = autoApproved ? true : (edit.approved !== undefined ? edit.approved : null);
-
-              const editorial_feedback = edit.editorial_feedback ? {
-                development: edit.editorial_feedback.development || [],
-                content: edit.editorial_feedback.content || [],
-                copy: edit.editorial_feedback.copy || [],
-                line: edit.editorial_feedback.line || [],
-                brand: edit.editorial_feedback.brand || []
-              } : undefined;
-
-              return {
-                index: paragraphIndex,
-                original: originalText,
-                edited: editedText,
-                tags: allTags,
-                autoApproved: autoApproved,
-                approved: approved,
-                editorial_feedback: editorial_feedback,
-                displayOriginal: originalText,
-                displayEdited: editedText
-              } as ParagraphEdit;
-            });
-          }
-          
-          // Update content
-          if (data.original_content) {
-            this.updateState({
-              ...this.currentState,
-              originalContent: data.original_content
-            });
-          }
-          
-          if (data.final_revised) {
-            finalRevisedContent = data.final_revised.trim();
-          }
-          
-          // Process feedback (only current editor's feedback)
-          if (data.combined_feedback) {
-            combinedFeedback = data.combined_feedback.trim();
-          }
-          
-          // Update state with paragraph edits for sequential mode
-          if (this.isSequentialMode && paragraphEdits.length > 0) {
-            this.updateState({
-              ...this.currentState,
-              paragraphEdits: paragraphEdits,
-              originalContent: data.original_content || this.currentState.originalContent
-            });
-            
-            // Dispatch results for sequential mode (show paragraph edits for approval)
-            this.dispatchResultsToChat('', selectedIds, selectedNames, combinedFeedback, finalRevisedContent, paragraphEdits);
-          }
-          
-          const progressMessage: Message = {
-            role: 'assistant',
-            content: '',
-            timestamp: new Date(),
-            editWorkflow: {
-              step: 'processing',
-              showCancelButton: false,
-              editorProgress: currentEditorProgress || undefined,
-              editorProgressList: [...editorProgressList],
-              // Add sequential workflow metadata
-              isSequentialMode: this.isSequentialMode,
-              threadId: this.threadId,
-              currentEditor: this.currentEditor,
-              currentEditorIndex: this.currentEditorIndex,
-              totalEditors: this.totalEditors,
-              isLastEditor: this.isLastEditor
+              </div>
             }
-          };
-          this.messageSubject.next({ type: 'prompt', message: progressMessage });
-        } else if (data.type === 'editor_error') {
-          const errorEditor = editorProgressList.find(e => e.editorId === data.editor);
-          if (errorEditor) {
-            errorEditor.status = 'error';
-          }
-          
-          editorErrors.push({
-            editor: data.editor || 'Unknown',
-            error: data.error || 'Unknown error'
-          });
-          
-          const editorName = getEditorDisplayName(data.editor);
-          const errorMessage: Message = {
-            role: 'assistant',
-            content: `⚠️ **${editorName} encountered an error:** ${data.error}\n\nContinuing with remaining editors...`,
-            timestamp: new Date(),
-            editWorkflow: {
-              step: 'processing',
-              showCancelButton: false,
-              editorProgress: currentEditorProgress || undefined,
-              editorProgressList: [...editorProgressList]
-            }
-          };
-          this.messageSubject.next({ type: 'prompt', message: errorMessage });
-        } else if (data.type === 'final_complete') {
-          // Reset sequential mode when all editors complete
-          this.isSequentialMode = false;
-          this.threadId = null;
-          this.currentEditor = null;
-          
-          combinedFeedback = data.combined_feedback || '';
-          finalRevisedContent = data.final_revised || '';
-          
-          let paragraphEdits: ParagraphEdit[] = [];
-          if (data.paragraph_edits && Array.isArray(data.paragraph_edits)) {
-            const allEditorNames = selectedIds.map(editorId => {
-              return getEditorDisplayName(editorId);
-            });
-            
-            // Get original content - prioritize data.original_content, then currentState
-            const originalContent = data.original_content || this.currentState.originalContent || '';
-            const originalParagraphs = originalContent ? splitIntoParagraphs(originalContent) : [];
-            
-            paragraphEdits = data.paragraph_edits.map((edit: any, arrayIndex: number) => {
-              const existingTags = edit.tags || [];
-              
-              const existingEditorNames = new Set<string>(
-                existingTags.map((tag: string) => {
-                  const match = tag.match(/^(.+?)\s*\(/);
-                  return match ? match[1].trim() : tag;
-                })
-              );
-              
-              const allTags = [...existingTags];
-              allEditorNames.forEach(editorName => {
-                const existingNamesArray = Array.from(existingEditorNames) as string[];
-                if (!existingNamesArray.some((existing: string) => 
-                  existing.toLowerCase().includes(editorName.toLowerCase()) || 
-                  editorName.toLowerCase().includes(existing.toLowerCase())
-                )) {
-                  allTags.push(`${editorName} (Reviewed)`);
-                }
-              });
-              
-              // Use edit.index if provided, otherwise use array index
-              // This ensures each paragraph has a unique index
-              const paragraphIndex = (edit.index !== undefined && edit.index !== null) ? edit.index : arrayIndex;
+          </div>
+        </div>
+      </div>
 
-              // Get original text - prioritize edit.original, then try to get from original content by index
-              const originalText = (edit.original && edit.original.trim()) || (originalParagraphs.length > paragraphIndex && paragraphIndex >= 0 ? (originalParagraphs[paragraphIndex] && originalParagraphs[paragraphIndex].trim()) || '' : '');
+      <div class="header-center">
+      </div>
 
-              // Ensure edited text is available
-              const editedText = (edit.edited && edit.edited.trim()) || '';
+      <div class="header-right">
+        <button
+          class="header-icon-btn"
+          (click)="goHome()"
+          type="button"
+          title="Home"
+          >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            >
+            <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+            <polyline points="9 22 9 12 15 12 15 22"></polyline>
+          </svg>
+        </button>
 
-              // Determine whether original and edited are identical (helper function imported)
-              const isIdentical = validateStringEquality(originalText, editedText);
-
-              // If the backend provided autoApproved flag, respect it; otherwise auto-approve when texts are identical
-              const autoApproved = edit.autoApproved !== undefined ? edit.autoApproved : isIdentical;
-              const approved = autoApproved ? true : (edit.approved !== undefined ? edit.approved : null);
-
-              // Preserve editorial_feedback from backend (same structure as guided journey)
-              const editorial_feedback = edit.editorial_feedback ? {
-                development: edit.editorial_feedback.development || [],
-                content: edit.editorial_feedback.content || [],
-                copy: edit.editorial_feedback.copy || [],
-                line: edit.editorial_feedback.line || [],
-                brand: edit.editorial_feedback.brand || []
-              } : undefined;
-
-              return {
-                index: paragraphIndex,
-                original: originalText,
-                edited: editedText,
-                tags: allTags,
-                autoApproved: autoApproved,
-                approved: approved,
-                editorial_feedback: editorial_feedback,
-                displayOriginal: originalText,
-                displayEdited: editedText
-              } as ParagraphEdit;
-            });
-          } else if (data.final_revised && data.original_content) {
-            paragraphEdits = this.createParagraphEditsFromComparison(
-              data.original_content,
-              data.final_revised,
-              selectedIds
-            );
-          }
-          
-          // Ensure originalContent is preserved - prioritize data.original_content, but keep existing if not provided
-          const preservedOriginalContent = data.original_content || this.currentState.originalContent || '';
-          
-          this.updateState({
-            ...this.currentState,
-            paragraphEdits: paragraphEdits,
-            originalContent: preservedOriginalContent
-          });
-          
-          editorProgressList.forEach(editor => {
-            if (editor.status !== 'error') {
-              editor.status = 'completed';
-            }
-          });
-          
-          const completedProgress: {current: number, total: number, currentEditor: string} = {
-            current: currentEditorProgress?.total || editorProgressList.length,
-            total: currentEditorProgress?.total || editorProgressList.length,
-            currentEditor: 'completed'
-          };
-          
-          const completionMessage: Message = {
-            role: 'assistant',
-            content: '',
-            timestamp: new Date(),
-            editWorkflow: {
-              step: 'processing',
-              showCancelButton: false,
-              editorProgress: completedProgress,
-              editorProgressList: [...editorProgressList]
-            }
-          };
-          this.messageSubject.next({ type: 'prompt', message: completionMessage });
-          
-          if (editorErrors.length > 0) {
-            const errorSummary = editorErrors.map(e => {
-              const editorName = getEditorDisplayName(e.editor);
-              return `⚠️ ${editorName} encountered an error: ${e.error}. Processing continued with previous editor's output.`;
-            }).join('\n\n');
-            
-            if (combinedFeedback) {
-              combinedFeedback = errorSummary + '\n\n' + combinedFeedback;
-            } else {
-              combinedFeedback = errorSummary;
-            }
-          }
-          
-          this.dispatchResultsToChat('', selectedIds, selectedNames, combinedFeedback, finalRevisedContent, paragraphEdits);
-        } else if (data.type === 'content' && data.content) {
-          fullResponse += data.content;
-        } else if (typeof data === 'string') {
-          fullResponse += data;
+        <button
+          class="header-icon-btn notifications"
+          type="button"
+          title="Notifications"
+          >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            >
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+          </svg>
+          <span class="notification-badge">3</span>
+        </button>
+        @if (user$ | async; as user) {
+          <button
+            class="header-icon-btn profile-menu"
+            type="button"
+            title="User profile"
+            >
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              >
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+              <circle cx="12" cy="7" r="4"></circle>
+            </svg>
+            <span class="username">{{ user.firstName }}</span>
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              class="dropdown-arrow"
+              >
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </button>
         }
-      },
-      error: (error: any) => {
-        const errorMsg: Message = {
-          role: 'assistant',
-          content: 'Sorry, there was an error editing your content. Please try again.',
-          timestamp: new Date()
-        };
-        this.messageSubject.next({ type: 'result', message: errorMsg });
-        this.completeWorkflow();
-      },
-      complete: () => {
-        this.completeWorkflow();
-      }
-    });
-  }
+      </div>
+    </header>
 
-  /** Create paragraph edits by comparing original and edited content */
-  private createParagraphEditsFromComparison(original: string, edited: string, editorIds?: string[]): ParagraphEdit[] {
-    const editorIdsToUse = editorIds || this.currentState.selectedEditors;
-    const allEditorNames = editorIdsToUse.map(editorId => {
-      return getEditorDisplayName(editorId);
-    });
-    
-    return createParagraphEditsFromComparison(original, edited, allEditorNames);
-  }
-  
-  private dispatchResultsToChat(
-    rawResponse: string,
-    selectedEditorIds: string[],
-    selectedEditorNames: string,
-    combinedFeedback?: string,
-    finalRevisedContent?: string,
-    paragraphEdits?: ParagraphEdit[],
-    extractedTitle?: string
-  ): void {
-    let feedbackMatch: RegExpMatchArray | null = null;
-    if (combinedFeedback) {
-      feedbackMatch = [null, combinedFeedback] as any;
-    } else {
-      feedbackMatch = rawResponse.match(/===\s*FEEDBACK\s*===\s*([\s\S]*?)(?====\s*REVISED ARTICLE\s*===|$)/i);
-    }
-    
-    let revisedContent = '';
-    if (finalRevisedContent && finalRevisedContent.trim()) {
-      revisedContent = finalRevisedContent.trim();
-    }
-    const uploadedFileName = this.currentState.uploadedFile?.name;
-    
-    // Extract title from original content (use provided extractedTitle or extract from content)
-    const documentTitle = extractedTitle || extractDocumentTitle(
-      this.currentState.originalContent || '',
-      uploadedFileName
-    );
-    const cleanTopic = documentTitle.trim() || 'Revised Article';
-    
-    let cleanFullContent = revisedContent || 'No revised article returned.';
-    cleanFullContent = cleanFullContent.replace(/^```[\w]*\n?/gm, '').replace(/\n?```$/gm, '').trim();
-    
-    const metadata = {
-      contentType: 'article' as const,
-      topic: cleanTopic,
-      fullContent: cleanFullContent,
-      showActions: !!revisedContent && cleanFullContent.length > 0
-    };
-    
-    // Send editorial feedback FIRST (matches Guided Journey display order)
-    if (feedbackMatch && feedbackMatch[1]) {
-      const feedbackPlainText = feedbackMatch[1].trim();
-      const feedbackTitle = '**📝 Editorial Feedback**';
-      const feedbackContent = feedbackPlainText;
-      const combinedFeedback = `${feedbackTitle}\n\n${feedbackContent}`;
-      const feedbackHtml = formatMarkdown(combinedFeedback);
-      
-      const feedbackMessage: Message = {
-        role: 'assistant',
-        content: feedbackHtml,
-        timestamp: new Date(),
-        isHtml: true, // Flag to indicate content is already HTML
-        thoughtLeadership: {
-          contentType: 'article',
-          topic: 'Editorial Feedback',
-          fullContent: feedbackPlainText,
-          showActions: true
-        }
-      };
-      this.messageSubject.next({ type: 'result', message: feedbackMessage });
-    }
-    
-    // Send paragraph-by-paragraph comparison AFTER editorial feedback (matches Guided Journey display order)
-    if (paragraphEdits && paragraphEdits.length > 0) {
-      const paragraphMessage: Message = {
-        role: 'assistant',
-        content: '', // Content will be rendered by Angular component
-        timestamp: new Date(),
-        isHtml: false,
-        editWorkflow: {
-          step: 'awaiting_approval',
-          paragraphEdits: paragraphEdits,
-          showCancelButton: false,
-          showSimpleCancelButton: true,
-          // Add sequential workflow metadata (same as Guided Journey)
-          isSequentialMode: this.isSequentialMode,
-          threadId: this.threadId,
-          currentEditor: this.currentEditor,
-          currentEditorIndex: this.currentEditorIndex,
-          totalEditors: this.totalEditors,
-          isLastEditor: this.isLastEditor
-        }
-      };
-      this.messageSubject.next({ type: 'result', message: paragraphMessage });
-    } else if (revisedContent && !paragraphEdits) {
-      const headerLines: string[] = [
-        '### Quick Start Thought Leadership – Edit Content'
-      ];
-      
-      if (uploadedFileName) {
-        headerLines.push(`_Source: ${uploadedFileName}_`);
-      }
-      
-      if (selectedEditorNames) {
-        headerLines.push(`_Editors Applied: ${selectedEditorNames}_`);
-      }
-      
-      headerLines.push('', '**Revised Article**', '');
-      
-      // If we have an extracted title, add it in bold before the content
-      if (extractedTitle && extractedTitle !== 'Revised Article') {
-        headerLines.push(`**${extractedTitle}**`, '');
-      }
-      
-      const headerHtml = convertMarkdownToHtml(headerLines.join('\n'));
-      const revisedHtml = convertMarkdownToHtml(revisedContent);
-      const combinedHtml = `${headerHtml}${revisedHtml}`;
-      
-      const revisedMessage: Message = {
-        role: 'assistant',
-        content: combinedHtml,
-        timestamp: new Date(),
-        isHtml: true,
-        thoughtLeadership: metadata
-      };
-      
-      this.messageSubject.next({ type: 'result', message: revisedMessage });
-    } else {
-      const errorContent = '### Quick Start Thought Leadership – Edit Content\n\n**Revised Article**\n\n_No revised article was returned. Please try again._';
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: convertMarkdownToHtml(errorContent),
-        timestamp: new Date(),
-        isHtml: true,
-        thoughtLeadership: metadata
-      };
-      this.messageSubject.next({ type: 'result', message: errorMessage });
-    }
-  }
+    <!-- Collapsible Left Sidebar -->
+    <aside
+      class="icon-sidebar"
+      [class.mobile-open]="mobileMenuOpen"
+      [class.expanded]="sidebarExpanded"
+      >
+      <div class="sidebar-header">
+        <button
+          class="sidebar-toggle-btn"
+          (click)="toggleSidebar()"
+          type="button"
+        [attr.aria-label]="
+          sidebarExpanded ? 'Collapse sidebar' : 'Expand sidebar'
+        "
+          >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            >
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+      </div>
 
-  cancelWorkflow(): void {
-    if (this.currentState.step === 'idle') {
-      return;
-    }
+      <nav class="icon-nav" role="navigation" aria-label="Main navigation">
+        <button
+          class="icon-nav-btn"
+          [class.active]="selectedFlow === 'ppt'"
+          [class.hidden]="!offeringVisibility['ppt']"
+          (click)="selectFlow('ppt')"
+          type="button"
+          title="Digital Document Development Center"
+          >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+            <path d="M7 7h5v5H7z"></path>
+            <path d="M14 7h3"></path>
+            <path d="M14 10h3"></path>
+          </svg>
+          <span class="nav-label">DDDC</span>
+        </button>
+        <button
+          class="icon-nav-btn"
+          [class.active]="selectedFlow === 'thought-leadership'"
+          [class.hidden]="!offeringVisibility['thought-leadership']"
+          (click)="selectFlow('thought-leadership')"
+          type="button"
+          title="Ideation-to-Publication"
+          >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2v2"></path>
+            <path d="M12 18v2"></path>
+            <path d="M4.93 4.93l1.41 1.41"></path>
+            <path d="M17.66 17.66l1.41 1.41"></path>
+            <path d="M2 12h2"></path>
+            <path d="M20 12h2"></path>
+            <path d="M6.34 17.66l-1.41 1.41"></path>
+            <path d="M19.07 4.93l-1.41 1.41"></path>
+            <circle cx="12" cy="12" r="5"></circle>
+            <path d="M12 12v-5"></path>
+          </svg>
+          <span class="nav-label">
+            <span class="label-line">Ideation-to-Publication</span>
+          </span>
+        </button>
+        <button
+          class="icon-nav-btn"
+          [class.active]="selectedFlow === 'market-intelligence'"
+          [class.hidden]="!offeringVisibility['market-intelligence']"
+          (click)="selectFlow('market-intelligence')"
+          type="button"
+          title="Market Intelligence & Insights"
+          >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+            <polyline points="4 14 8 10 12 15 16 8 20 12" />
+            <line x1="4" y1="19" x2="20" y2="19" />
+            <line x1="4" y1="4" x2="4" y2="19" />
+          </svg>
+          <span class="nav-label">
+            <span class="label-line">Market Intelligence & Insights</span>
+          </span>
+        </button>
+        <button
+          class="icon-nav-btn"
+          (click)="showHistoryPanel = !showHistoryPanel"
+          [class.active]="showHistoryPanel"
+          type="button"
+          title="Chat History"
+          >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            >
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+            <path d="M3 3v5h5"></path>
+            <path d="M12 7v5l4 2"></path>
+          </svg>
+          <span class="nav-label">History</span>
+        </button>
+        <button class="icon-nav-btn" type="button" title="New Chat" (click)="startNewChat()">
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            >
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+          </svg>
+          <span class="nav-label">New Chat</span>
+        </button>
+      </nav>
+    </aside>
 
-    if (this.currentState.step === 'processing') {
-      return;
-    }
-
-    this.updateState(this.getDefaultState());
-    this.workflowCompletedSubject.next();
-
-    const cancelMessage: Message = {
-      role: 'assistant',
-      content: 'Edit workflow cancelled. How else can I help you?',
-      timestamp: new Date()
-    };
-
-    this.messageSubject.next({
-      type: 'prompt',
-      message: cancelMessage
-    });
-  }
-
-  completeWorkflow(): void {
-    this.updateState(this.getDefaultState());
-    this.workflowCompletedSubject.next();
-  }
-
-  private updateState(newState: EditWorkflowState): void {
-    this.stateSubject.next(newState);
-  }
-
-  
-  /** Sanitize HTML content using Angular's DomSanitizer */
-  private sanitizeHtml(html: string): SafeHtml {
-    return this.sanitizer.bypassSecurityTrustHtml(html);
-  }
-  
-  private getDefaultState(): EditWorkflowState {
-    // Reset sequential workflow properties
-    this.threadId = null;
-    this.currentEditor = null;
-    this.isSequentialMode = false;
-    this.isLastEditor = false;
-    this.currentEditorIndex = 0;
-    this.totalEditors = 0;
-    
-    return {
-      step: 'idle',
-      uploadedFile: null,
-      selectedEditors: ['brand-alignment'],
-      originalContent: '',
-      paragraphEdits: []
-    };
-  }
-
-  private cloneEditorOptions(): EditorOption[] {
-    return this.editorOptions.map(opt => ({ ...opt }));
-  }
-
-  private createEditorSelectionMessage(content: string, editorOptions?: EditorOption[]): Message {
-    const editors = editorOptions || this.cloneEditorOptions();
-    // Set default selection state (only brand-alignment selected by default, and always selected)
-    const defaultSelectedIds = ['brand-alignment'];
-    const editorsWithSelection = editors.map(editor => ({
-      ...editor,
-      selected: defaultSelectedIds.includes(editor.id),
-      // Mark brand-alignment as always selected and disabled
-      disabled: editor.id === 'brand-alignment',
-      alwaysSelected: editor.id === 'brand-alignment'
-    }));
-
-    return {
-      role: 'assistant',
-      content,
-      timestamp: new Date(),
-      editWorkflow: {
-        step: 'awaiting_editors',
-        showEditorSelection: true, // Enable visual UI component
-        showCancelButton: false,
-        showSimpleCancelButton: false,
-        editorOptions: editorsWithSelection
-      }
-    };
-  }
-
-  private createNoEditorsErrorMessage(editorOptions?: EditorOption[]): void {
-    const errorMessage = this.createEditorSelectionMessage(
-      `⚠️ **Please select at least one editing service** before proceeding.`,
-      editorOptions
-    );
-    this.messageSubject.next({ type: 'prompt', message: errorMessage });
-  }
-  
-  /** Approve a paragraph edit */
-  approveParagraph(index: number): void {
-    const paragraphIndex = this.currentState.paragraphEdits.findIndex(p => p.index === index);
-    
-    if (paragraphIndex === -1) {
-      return;
-    }
-    
-    // Create new array with updated paragraph (new object reference for Angular change detection)
-    const updatedParagraphEdits = this.currentState.paragraphEdits.map((p, i) => 
-      i === paragraphIndex 
-        ? { ...p, approved: true as boolean | null }
-        : p
-    );
-    
-    this.updateState({
-      ...this.currentState,
-      paragraphEdits: updatedParagraphEdits
-    });
-    
-    // Emit update message to notify chat component
-    this.emitParagraphUpdateMessage();
-  }
-  
-  /** Decline a paragraph edit */
-  declineParagraph(index: number): void {
-    const paragraphIndex = this.currentState.paragraphEdits.findIndex(p => p.index === index);
-    
-    if (paragraphIndex === -1) {
-      return;
-    }
-    
-    // Create new array with updated paragraph (new object reference for Angular change detection)
-    const updatedParagraphEdits = this.currentState.paragraphEdits.map((p, i) => 
-      i === paragraphIndex 
-        ? { ...p, approved: false as boolean | null }
-        : p
-    );
-    
-    this.updateState({
-      ...this.currentState,
-      paragraphEdits: updatedParagraphEdits
-    });
-    
-    // Emit update message to notify chat component
-    this.emitParagraphUpdateMessage();
-  }
-  
-  /** Emit update message for paragraph edits */
-  private emitParagraphUpdateMessage(): void {
-    const updateMessage: Message = {
-      role: 'assistant',
-      content: '', // Content rendered by Angular component
-      timestamp: new Date(),
-      isHtml: false,
-      editWorkflow: {
-        step: 'awaiting_approval',
-        paragraphEdits: [...this.currentState.paragraphEdits],
-        showCancelButton: false,
-        showSimpleCancelButton: true
-      }
-    };
-    
-    this.messageSubject.next({ type: 'update', message: updateMessage });
-  }
-  
-  /** Sync paragraph edits from message to service state (for final article generation) */
-  syncParagraphEditsFromMessage(paragraphEdits: ParagraphEdit[]): void {
-    if (paragraphEdits && paragraphEdits.length > 0) {
-      // Reconstruct originalContent from paragraphEdits if service state doesn't have it
-      let originalContent = this.currentState.originalContent;
-      if (!originalContent || !originalContent.trim()) {
-        originalContent = this.reconstructOriginalContent(paragraphEdits);
-      }
-      
-      this.updateState({
-        ...this.currentState,
-        paragraphEdits: [...paragraphEdits],
-        originalContent: originalContent || this.currentState.originalContent
-      });
-    }
-  }
-  
-  /** Check if all paragraphs have been decided */
-  get allParagraphsDecided(): boolean {
-    return allParagraphsDecided(this.currentState.paragraphEdits);
-  }
-
-  /** Get paragraphs that require user review (excludes auto-approved) */
-  get getParagraphsForReview(): ParagraphEdit[] {
-    return this.currentState.paragraphEdits.filter(p => p.autoApproved !== true).sort((a, b) => a.index - b.index);
-  }
-  
-  /** Reconstruct original content from paragraph edits (like Guided Journey) */
-  private reconstructOriginalContent(paragraphEdits: ParagraphEdit[]): string {
-    if (!paragraphEdits || paragraphEdits.length === 0) {
-      return '';
-    }
-    
-    // Sort by index to ensure correct order
-    const sortedEdits = [...paragraphEdits].sort((a, b) => a.index - b.index);
-    
-    // Combine all original paragraphs
-    return sortedEdits.map(p => p.original).filter(p => p && p.trim()).join('\n\n');
-  }
-  
-  /** Generate final article using approved edits */
-  async generateFinalArticle(): Promise<void> {
-    if (!this.allParagraphsDecided) {
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: '⚠️ **Please approve or decline all paragraph edits** before generating the final article.',
-        timestamp: new Date()
-      };
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-      return;
-    }
-    
-    this.isGeneratingFinalSubject.next(true);
-    
-    try {
-      const decisions = this.currentState.paragraphEdits.map(p => ({
-        index: p.index,
-        approved: p.approved === true
-      }));
-      
-      // Get originalContent - use service state if available, otherwise reconstruct from paragraphEdits
-      let originalContent = this.currentState.originalContent;
-      
-      if (!originalContent || !originalContent.trim()) {
-        originalContent = this.reconstructOriginalContent(this.currentState.paragraphEdits);
-      }
-      
-      if (!originalContent || !originalContent.trim()) {
-        throw new Error('Original content cannot be empty. Unable to reconstruct from paragraph edits.');
-      }
-      
-      const response = await fetch('/api/v1/tl/edit-content/final', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          original_content: originalContent,
-          paragraph_edits: this.currentState.paragraphEdits.map(p => ({
-            index: p.index,
-            original: p.original,
-            edited: p.edited,
-            tags: p.tags
-          })),
-          decisions: decisions
-        })
-      });
-      
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => 'Unknown error');
-        throw new Error(`Failed to generate final article: ${response.status} ${errorText}`);
-      }
-      
-      const data = await response.json();
-      const finalArticle = data.final_article || '';
-      
-      if (!finalArticle) {
-        throw new Error('No final article returned from server');
-      }
-      
-      // Update paragraph message to show final output (component will handle display)
-      const updatedParagraphEdits = [...this.currentState.paragraphEdits];
-      
-      // Create final article HTML for separate message
-      const uploadedFileName = this.currentState.uploadedFile?.name;
-      const selectedEditorNames = this.getSelectedEditorNames(this.currentState.selectedEditors);
-      
-      const headerLines: string[] = [
-        '### Quick Start Thought Leadership – Edit Content'
-      ];
-      
-      if (uploadedFileName) {
-        headerLines.push(`_Source: ${uploadedFileName}_`);
-      }
-      
-      if (selectedEditorNames) {
-        headerLines.push(`_Editors Applied: ${selectedEditorNames}_`);
-      }
-      
-      headerLines.push('');
-      
-      const headerHtml = convertMarkdownToHtml(headerLines.join('\n'));
-      const finalHtml = convertMarkdownToHtml(finalArticle);
-      const finalArticleHtml = `${headerHtml}<div class="result-section"><h4 class="result-title">Final Revised Article</h4><div class="assistant-message revised-content-formatted">${finalHtml}</div></div>`;
-      
-      const finalMessage: Message = {
-        role: 'assistant',
-        content: finalArticleHtml,
-        timestamp: new Date(),
-        isHtml: true,
-        thoughtLeadership: {
-          contentType: 'article',
-          topic: 'Final Revised Article',
-          fullContent: finalArticle,
-          showActions: true
-        }
-      };
-      
-      // Send final article message (paragraph edits remain visible in previous message)
-      this.messageSubject.next({ type: 'result', message: finalMessage });
-      this.completeWorkflow();
-      
-    } catch (error) {
-      console.error('Error generating final article:', error);
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: `⚠️ **Failed to generate final article.** ${error instanceof Error ? error.message : 'Please try again.'}`,
-        timestamp: new Date()
-      };
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-    } finally {
-      this.isGeneratingFinalSubject.next(false);
-    }
-  }
-
-  /** Move to next editor in sequential workflow */
-  async nextEditor(): Promise<void> {
-    if (!this.threadId) {
-      console.error('[ChatEditWorkflow] No thread_id available for next editor');
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: '⚠️ **Error:** No active editing session found. Please start a new edit workflow.',
-        timestamp: new Date()
-      };
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-      return;
-    }
-
-    if (!this.allParagraphsDecided) {
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: '⚠️ **Please approve or reject all paragraph edits** before proceeding to the next editor.',
-        timestamp: new Date()
-      };
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-      return;
-    }
-
-    this.updateState({
-      ...this.currentState,
-      step: 'processing'
-    });
-
-    try {
-      // Collect decisions from paragraphEdits
-      const decisions = this.currentState.paragraphEdits.map(para => ({
-        index: para.index,
-        approved: para.approved === true
-      }));
-
-      // Prepare paragraph_edits with editorial_feedback
-      const paragraph_edits = this.currentState.paragraphEdits.map(para => ({
-        index: para.index,
-        original: para.original,
-        edited: para.edited,
-        tags: para.tags || [],
-        autoApproved: para.autoApproved || false,
-        approved: para.approved,
-        editorial_feedback: para.editorial_feedback
-      }));
-
-      const apiUrl = (window as any)._env?.apiUrl || '';
-      const response = await fetch(`${apiUrl}/api/v1/tl/edit-content/next`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          thread_id: this.threadId,
-          paragraph_edits: paragraph_edits,
-          decisions: decisions,
-          accept_all: false,
-          reject_all: false
-        })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => 'Unknown error');
-        throw new Error(`Failed to proceed to next editor: ${response.status} ${errorText}`);
-      }
-
-      // Handle streaming response (same pattern as guided journey)
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      if (!reader) {
-        throw new Error('No response body reader available');
-      }
-
-      let combinedFeedback = '';
-      let finalRevisedContent = '';
-      let paragraphEdits: ParagraphEdit[] = [];
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6).trim();
-            if (dataStr && dataStr !== '[DONE]') {
-              try {
-                const data = JSON.parse(dataStr);
-                
-                // Handle all_complete
-                if (data.type === 'all_complete') {
-                  this.isSequentialMode = false;
-                  this.isLastEditor = true;
-                  this.currentEditorIndex = this.totalEditors;
-                  this.updateState({
-                    ...this.currentState,
-                    step: 'awaiting_approval'
-                  });
-                  return;
-                }
-
-                // Handle editor_complete (same as initial flow)
-                if (data.type === 'editor_complete') {
-                  if (data.thread_id) {
-                    this.threadId = data.thread_id;
-                  }
-
-                  if (data.current_editor) {
-                    this.currentEditor = data.current_editor;
-                    this.currentEditorIndex = data.editor_index || 0;
-                    this.totalEditors = data.total_editors || this.totalEditors;
-                    this.isLastEditor = (data.editor_index || 0) >= (data.total_editors || 1) - 1;
-                  }
-
-                  // Process paragraph edits (same logic as above)
-                  if (data.paragraph_edits && Array.isArray(data.paragraph_edits)) {
-                    const allEditorNames = this.currentState.selectedEditors.map(editorId => {
-                      return getEditorDisplayName(editorId);
-                    });
-                    
-                    const originalContent = data.original_content || this.currentState.originalContent || '';
-                    const originalParagraphs = originalContent ? splitIntoParagraphs(originalContent) : [];
-                    
-                    paragraphEdits = data.paragraph_edits.map((edit: any, arrayIndex: number) => {
-                      const paragraphIndex = (edit.index !== undefined && edit.index !== null) ? edit.index : arrayIndex;
-                      const originalText = (edit.original && edit.original.trim()) || (originalParagraphs.length > paragraphIndex && paragraphIndex >= 0 ? (originalParagraphs[paragraphIndex] && originalParagraphs[paragraphIndex].trim()) || '' : '');
-                      const editedText = (edit.edited && edit.edited.trim()) || '';
-                      const isIdentical = validateStringEquality(originalText, editedText);
-                      const autoApproved = edit.autoApproved !== undefined ? edit.autoApproved : isIdentical;
-                      const approved = autoApproved ? true : (edit.approved !== undefined ? edit.approved : null);
-
-                      const editorial_feedback = edit.editorial_feedback ? {
-                        development: edit.editorial_feedback.development || [],
-                        content: edit.editorial_feedback.content || [],
-                        copy: edit.editorial_feedback.copy || [],
-                        line: edit.editorial_feedback.line || [],
-                        brand: edit.editorial_feedback.brand || []
-                      } : undefined;
-
-                      return {
-                        index: paragraphIndex,
-                        original: originalText,
-                        edited: editedText,
-                        tags: edit.tags || [],
-                        autoApproved: autoApproved,
-                        approved: approved,
-                        editorial_feedback: editorial_feedback,
-                        displayOriginal: originalText,
-                        displayEdited: editedText
-                      } as ParagraphEdit;
-                    });
-                  }
-
-                  if (data.original_content) {
-                    this.updateState({
-                      ...this.currentState,
-                      originalContent: data.original_content
-                    });
-                  }
-
-                  if (data.final_revised) {
-                    finalRevisedContent = data.final_revised.trim();
-                  }
-
-                  if (data.combined_feedback) {
-                    combinedFeedback = data.combined_feedback.trim();
-                  }
-
-                  // Update state with new paragraph edits
-                  this.updateState({
-                    ...this.currentState,
-                    paragraphEdits: paragraphEdits,
-                    step: 'awaiting_approval'
-                  });
-
-                  // Dispatch results
-                  const selectedNames = this.getSelectedEditorNames(this.currentState.selectedEditors);
-                  this.dispatchResultsToChat('', this.currentState.selectedEditors, selectedNames, combinedFeedback, finalRevisedContent, paragraphEdits);
-                }
-
-                // Handle errors
-                if (data.type === 'error') {
-                  throw new Error(data.error || 'Unknown error');
-                }
-              } catch (e) {
-                console.error('[ChatEditWorkflow] Error parsing SSE data:', e);
+    <!-- Chat History Panel -->
+    <div class="history-panel" [class.show]="showHistoryPanel">
+      <div class="history-header">
+        <h3>Chat History</h3>
+        <button
+          class="close-history-btn"
+          (click)="showHistoryPanel = false"
+          type="button"
+          aria-label="Close history"
+          >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            >
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="history-content">
+        <div class="history-search">
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            class="search-icon"
+            >
+            <circle cx="11" cy="11" r="8"></circle>
+            <path d="m21 21-4.35-4.35"></path>
+          </svg>
+          <input
+            type="text"
+            placeholder="Search history..."
+            class="history-search-input"
+            />
+          </div>
+          @if (savedSessions.length > 0) {
+            <div class="history-list">
+              @for (session of savedSessions; track session) {
+                <button
+                  class="history-item"
+                  (click)="loadSession(session.id); showHistoryPanel = false"
+                  type="button"
+                  >
+                  <div class="history-item-content">
+                    <h4 class="history-item-title">{{ session.title }}</h4>
+                    <p class="history-item-date">
+                      {{ session.lastModified | date: "MMM d, h:mm a" }}
+                    </p>
+                  </div>
+                  <button
+                    class="history-item-delete"
+                    (click)="deleteSession(session.id, $event)"
+                    type="button"
+                    aria-label="Delete chat"
+                    >
+                    <svg
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      >
+                      <polyline points="3 6 5 6 21 6"></polyline>
+                      <path
+                        d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+                      ></path>
+                    </svg>
+                  </button>
+                </button>
               }
-            }
+            </div>
           }
+          @if (savedSessions.length === 0) {
+            <div class="history-empty">
+              <svg
+                width="48"
+                height="48"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                >
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+                <path d="M3 3v5h5"></path>
+                <path d="M12 7v5l4 2"></path>
+              </svg>
+              <p>No chat history yet</p>
+              <span>Your conversations will appear here</span>
+            </div>
+          }
+        </div>
+      </div>
+
+      <!-- Main Content -->
+      <main class="main-content">
+        <!-- MCX AI Banner -->
+        <div class="mcx-banner">
+          <div class="banner-content">
+            <h1 class="banner-title">{{ getFeatureName() }}</h1>
+          </div>
+          <div class="banner-image"></div>
+        </div>
+
+        <!-- Welcome/Quick Start Area -->
+        @if (messages.length === 0 && !showDraftForm) {
+          <div
+            class="content-area welcome-screen"
+            >
+            <!-- Centered Conversation Starter -->
+            <div class="welcome-center">
+              <!-- Quick Start and Guided Journey buttons -->
+              <div class="top-action-buttons">
+                <button
+                  #quickStartBtn
+                  class="top-action-btn primary"
+                  (click)="quickStart()"
+                  type="button"
+                  aria-label="Start quick conversation - Begin chatting immediately with AI assistance"
+                  >
+                  <div class="btn-icon-badge">
+                    <svg
+                      width="24"
+                      height="24"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      >
+                      <polygon
+                        points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"
+                      ></polygon>
+                    </svg>
+                  </div>
+                  <div class="btn-content">
+                    <h3 class="btn-heading">Quick Start</h3>
+                    <p class="btn-description">
+                      Begin chatting immediately and get instant AI-powered assistance
+                    </p>
+                  </div>
+                </button>
+                <button
+                  class="top-action-btn guided"
+                  (click)="openGuidedDialog()"
+                  type="button"
+                  aria-label="Guided Journey - Step-by-step form for structured workflows"
+                  >
+                  <div class="btn-icon-badge">
+                    <svg
+                      width="24"
+                      height="24"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      >
+                      <path
+                        d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"
+                      ></path>
+                      <circle cx="12" cy="10" r="3"></circle>
+                    </svg>
+                  </div>
+                  <div class="btn-content">
+                    <h3 class="btn-heading">Guided Journey</h3>
+                    <p class="btn-description">
+                      Follow a step-by-step wizard to create comprehensive documents
+                    </p>
+                  </div>
+                </button>
+              </div>
+              <div class="welcome-message">
+                <h2>How can I help you today?</h2>
+                <p>
+                  @if (selectedFlow === 'thought-leadership') {
+                    <span>Choose from popular actions below or start chatting</span>
+                  }
+                  @if (selectedFlow === 'ppt') {
+                    <span>Choose from popular actions below or start chatting</span>
+                  }
+                  @if (selectedFlow === 'market-intelligence') {
+                    <span>Click below to explore Market Intelligence & Insights or begin chatting</span>
+                  }
+                </p>
+              </div>
+            </div>
+            <!-- Quick Action Dropdown Buttons - DDC Feature -->
+            @if (selectedFlow === 'ppt') {
+              <div class="quick-action-dropdowns">
+                <!-- First Row: 4 buttons -->
+                <div class="button-wrapper">
+                  <button class="dropdown-btn" (click)="openDdcWorkflow('slide-creation')" type="button">
+                    <div class="btn-icon">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="12" y1="8" x2="12" y2="16"></line>
+                        <line x1="8" y1="12" x2="16" y2="12"></line>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Deck Development (From Prompt)</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button class="dropdown-btn" (click)="openDdcWorkflow('slide-creation')" type="button">
+                    <div class="btn-icon">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="12" y1="8" x2="12" y2="16"></line>
+                        <line x1="8" y1="12" x2="16" y2="12"></line>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Deck Development (From Document)</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button class="dropdown-btn" (click)="openDdcWorkflow('sanitization')" type="button">
+                    <div class="btn-icon">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                        <path d="M9 12l2 2 4-4"></path>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Sanitization</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button class="dropdown-btn disabled" (click)="openDdcWorkflow('brand-format')" type="button" disabled>
+                    <div class="btn-icon">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10c.93 0 1.5-.65 1.5-1.5 0-.44-.15-.84-.4-1.13-.24-.29-.4-.69-.4-1.12 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.97-4.48-9-10-9z"></path>
+                        <circle cx="6.5" cy="11.5" r="1.5"></circle>
+                        <circle cx="9.5" cy="7.5" r="1.5"></circle>
+                        <circle cx="14.5" cy="7.5" r="1.5"></circle>
+                        <circle cx="17.5" cy="11.5" r="1.5"></circle>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Existing Deck Refinement</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button class="dropdown-btn disabled" (click)="openDdcWorkflow('client-customization')" type="button" disabled>
+                    <div class="btn-icon">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="16 3 21 3 21 8"></polyline>
+                        <line x1="4" y1="20" x2="21" y2="3"></line>
+                        <polyline points="21 16 21 21 16 21"></polyline>
+                        <line x1="15" y1="15" x2="21" y2="21"></line>
+                        <line x1="4" y1="4" x2="9" y2="9"></line>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Template Conversion</span>
+                  </button>
+                </div>
+              </div>
+            }
+            <!-- Quick Action Dropdown Buttons - Thought Leadership Feature -->
+            @if (selectedFlow === 'thought-leadership') {
+              <div
+                class="quick-action-dropdowns tl-actions"
+                >
+                <div class="button-wrapper">
+                  <button
+                    class="dropdown-btn"
+                    (click)="onTLActionCardClick('draft-content')"
+                    type="button"
+                    >
+                    <div class="btn-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        >
+                        <path d="M12 20h9"></path>
+                        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Draft Content</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button
+                    class="dropdown-btn"
+                    (click)="onTLActionCardClick('conduct-research')"
+                    type="button"
+                    >
+                    <div class="btn-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        >
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <path d="m21 21-4.35-4.35"></path>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Market Intelligence & Insights</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button
+                    class="dropdown-btn"
+                    (click)="onTLActionCardClick('edit-content')"
+                    type="button"
+                    >
+                    <div class="btn-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        >
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Edit Content</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button
+                    class="dropdown-btn"
+                    (click)="onTLActionCardClick('refine-content')"
+                    type="button"
+                    >
+                    <div class="btn-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        >
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <polyline points="9 13 11 15 15 11"></polyline>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Refine Content</span>
+                  </button>
+                </div>
+                <div class="button-wrapper">
+                  <button
+                    class="dropdown-btn"
+                    (click)="onTLActionCardClick('format-translator')"
+                    type="button"
+                    >
+                    <div class="btn-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        >
+                        <polyline points="16 3 21 3 21 8"></polyline>
+                        <line x1="4" y1="20" x2="21" y2="3"></line>
+                        <polyline points="21 16 21 21 16 21"></polyline>
+                        <line x1="15" y1="15" x2="21" y2="21"></line>
+                        <line x1="4" y1="4" x2="9" y2="9"></line>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Format Translator</span>
+                  </button>
+                </div>
+              </div>
+            }
+            <!-- Quick Action Dropdown Buttons - Market Intelligence Feature -->
+            @if (selectedFlow === 'market-intelligence') {
+              <div
+                class="quick-action-dropdowns mi-actions"
+                >
+                <div class="button-wrapper">
+                  <button
+                    class="dropdown-btn"
+                    (click)="onMIActionCardClick('conduct-research')"
+                    type="button"
+                    >
+                    <div class="btn-icon">
+                      <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        >
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <path d="m21 21-4.35-4.35"></path>
+                      </svg>
+                    </div>
+                    <span class="btn-label">Market Intelligence & Insights</span>
+                  </button>
+                </div>
+              </div>
+            }
+          </div>
         }
-      }
-    } catch (error) {
-      console.error('[ChatEditWorkflow] Error in nextEditor:', error);
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: `⚠️ **Failed to proceed to next editor.** ${error instanceof Error ? error.message : 'Please try again.'}`,
-        timestamp: new Date()
-      };
-      this.messageSubject.next({ type: 'prompt', message: errorMessage });
-      this.updateState({
-        ...this.currentState,
-        step: 'awaiting_approval'
-      });
-    }
-  }
-}
+
+        <!-- Chat Messages Area -->
+        @if (messages.length > 0 || showDraftForm) {
+          <div
+            class="content-area chat-area"
+            >
+            <div class="messages-wrapper" #messagesContainer>
+              @for (message of messages; track message; let i = $index) {
+                <div
+                  class="message"
+                  [class.user-message]="message.role === 'user'"
+                  [class.assistant-message]="message.role === 'assistant'"
+                  >
+                  <div class="message-content">
+                    @if (message.role === 'assistant') {
+                      <div class="message-avatar">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <rect x="5" y="7" width="14" height="12" rx="2"></rect>
+                          <path d="M12 7V4"></path>
+                          <circle cx="9" cy="12" r="1" fill="currentColor"></circle>
+                          <circle cx="15" cy="12" r="1" fill="currentColor"></circle>
+                          <path d="M9 16h6"></path>
+                        </svg>
+                      </div>
+                    }
+                    <div class="message-bubble">
+                      <!-- Action in Progress Indicator -->
+                      @if (message.actionInProgress) {
+                        <div class="action-progress">
+                          <div class="progress-icon">
+                            <svg
+                              class="spinner"
+                              width="16"
+                              height="16"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              >
+                              <path
+                                d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"
+                                />
+                              </svg>
+                            </div>
+                            <span>{{ message.actionInProgress }}</span>
+                          </div>
+                        }
+                        <!-- Edit Content Workflow: Editor Progress Indicator -->
+                        @if (message.editWorkflow?.editorProgressList && message.editWorkflow?.step === 'processing') {
+                          <app-editor-progress
+                            [editors]="message.editWorkflow?.editorProgressList || []"
+                            [currentEditor]="message.editWorkflow?.editorProgress?.currentEditor || ''"
+                            [currentIndex]="message.editWorkflow?.editorProgress?.current || 0"
+                            [totalEditors]="message.editWorkflow?.editorProgress?.total || (message.editWorkflow?.editorProgressList?.length ?? 0)">
+                          </app-editor-progress>
+                        }
+                        <!-- Sequential Workflow Progress Indicator -->
+                        @if (message.editWorkflow?.isSequentialMode && message.editWorkflow?.currentEditor) {
+                          <div class="sequential-progress">
+                            <div class="progress-header">
+                              <h4 class="progress-title">Editor Progress</h4>
+                              <span class="progress-badge">
+                                {{ (message.editWorkflow.currentEditorIndex || 0) + 1 }} of {{ message.editWorkflow.totalEditors || 1 }}
+                              </span>
+                            </div>
+                            <div class="progress-bar-container">
+                              <div class="progress-bar" [style.width.%]="(((message.editWorkflow.currentEditorIndex || 0) + 1) / (message.editWorkflow.totalEditors || 1)) * 100"></div>
+                            </div>
+                            <p class="progress-text">
+                              Current Editor: <strong>{{ getEditorDisplayName(message.editWorkflow.currentEditor) }}</strong>
+                            </p>
+                          </div>
+                        }
+                        <!-- Edit Content Workflow: Paragraph Edits Component -->
+                        @if ((message.editWorkflow?.paragraphEdits?.length ?? 0) > 0) {
+                          <app-paragraph-edits
+                            [paragraphEdits]="message.editWorkflow!.paragraphEdits!"
+                            [showFinalOutput]="false"
+                            [isGeneratingFinal]="getParagraphEditsGeneratingState(message)"
+                            (paragraphApproved)="onParagraphApproved(message, $event)"
+                            (paragraphDeclined)="onParagraphDeclined(message, $event)"
+                            (generateFinal)="onGenerateFinalArticle(message)">
+                          </app-paragraph-edits>
+                        }
+                        <!-- Typing dots indicator - positioned above message text -->
+                        @if (message.isStreaming || (message.role === 'assistant' && !message.content)) {
+                          <div class="typing-dots" aria-hidden="true">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                          </div>
+                        }
+                        @if ((message.thoughtLeadership?.topic === 'Editorial Feedback' || ((!message.editWorkflow?.editorProgressList || message.editWorkflow?.step !== 'processing') && (!message.editWorkflow?.paragraphEdits || message.editWorkflow?.paragraphEdits?.length === 0))) && !shouldHideEditorialFeedback(message, i)) {
+                          <div
+                            class="message-text"
+                            [innerHTML]="message.role === 'assistant' && message.sources ? (message.content | sourceCitation:message.sources) : getFormattedContent(message)"
+                          ></div>
+                        }
+                        <!-- Edit Content Workflow: Editor Selection -->
+                        @if (message.editWorkflow?.showEditorSelection && message.editWorkflow?.editorOptions) {
+                          <app-editor-selection
+                            [editors]="message.editWorkflow?.editorOptions || []"
+                            (selectionChanged)="onWorkflowEditorsSelectionChanged(message, $event)"
+                            (submitted)="onWorkflowEditorsSubmitted($event)"
+                            (cancelled)="onWorkflowCancelled()">
+                          </app-editor-selection>
+                        }
+                        <!-- Edit Content Workflow: File Upload (Step 2 - awaiting_content) -->
+                        @if (message.editWorkflow?.showFileUpload && editWorkflowService.isActive) {
+                          <app-file-upload
+                            accept=".docx,.pdf,.txt,.md"
+                            label="Upload Documents"
+                            [uploadedFile]="getUploadedFileForMessage(message)"
+                            (fileSelected)="onWorkflowFileSelected($event)"
+                            (fileRemoved)="onWorkflowFileRemoved()"
+                            class="workflow-file-upload">
+                          </app-file-upload>
+                        }
+                        <!-- Edit Content Workflow: Simple Cancel Button (Step 2 - awaiting_content) -->
+                        @if (message.editWorkflow?.showSimpleCancelButton && editWorkflowService.isActive) {
+                          <div class="workflow-cancel-container">
+                            <button
+                              class="workflow-cancel-btn simple-cancel-btn"
+                              (click)="onWorkflowCancelled()"
+                              type="button">
+                              Cancel
+                            </button>
+                          </div>
+                        }
+                        <!-- Edit Content Workflow: Cancel Workflow Button (Step 3+ - processing, disabled) -->
+                        @if (message.editWorkflow?.showCancelButton && !message.editWorkflow?.showEditorSelection && !message.editWorkflow?.showSimpleCancelButton && editWorkflowService.isActive) {
+                          <div class="workflow-cancel-container">
+                            <button
+                              class="workflow-cancel-btn"
+                              (click)="onWorkflowCancelled()"
+                              [disabled]="message.editWorkflow?.cancelButtonDisabled"
+                              type="button">
+                              Cancel Workflow
+                            </button>
+                          </div>
+                        }
+                        <!-- Thought Leadership Action Buttons (Only for results: Editorial Feedback and Revised Article in Quick Start Edit) -->
+                        @if (shouldShowTLActions(message) && isEditWorkflowResult(message)) {
+                          @if (getTLMetadata(message); as metadata) {
+                            <app-tl-action-buttons
+                              [metadata]="metadata"
+                              [messageId]="'msg_' + i">
+                            </app-tl-action-buttons>
+                          }
+                          <!-- Quick Start Edit Content: Sequential Workflow Actions -->
+                          @if ((message.editWorkflow?.paragraphEdits?.length ?? 0) > 0) {
+                            <!-- Sequential Mode: Show both Generate Final Output and Next Editor side by side -->
+                            @if (message.editWorkflow?.isSequentialMode) {
+                              <div class="sequential-actions-container">
+                                <!-- Generate Final Output Button (left side) -->
+                                <div class="final-output-actions">
+                                  <button
+                                    class="final-output-btn"
+                                    type="button"
+                                    [disabled]="getParagraphEditsGeneratingState(message) || !editWorkflowService.allParagraphsDecided"
+                                    (click)="onGenerateFinalArticle(message)">
+                                    @if (getParagraphEditsGeneratingState(message)) {
+                                      <span class="spinner small"></span>
+                                    }
+                                    {{ getParagraphEditsGeneratingState(message) ? 'Generating Final Output...' : 'Generate Final Output' }}
+                                  </button>
+                                  @if (!editWorkflowService.allParagraphsDecided) {
+                                    <p class="final-output-hint">
+                                      Please approve or reject all paragraph edits and feedback to generate the final article.
+                                    </p>
+                                  }
+                                </div>
+                                <!-- Next Editor Button (right side, only if not last editor) -->
+                                @if (!message.editWorkflow?.isLastEditor) {
+                                  <div class="next-editor-actions">
+                                    <button
+                                      class="next-editor-btn"
+                                      type="button"
+                                      [disabled]="getParagraphEditsGeneratingState(message) || !editWorkflowService.allParagraphsDecided"
+                                      (click)="onNextEditor(message)">
+                                      @if (getParagraphEditsGeneratingState(message)) {
+                                        <span class="spinner small"></span>
+                                      }
+                                      {{ getParagraphEditsGeneratingState(message) ? 'Loading Next Editor...' : 'Next Editor →' }}
+                                    </button>
+                                    @if (!editWorkflowService.allParagraphsDecided) {
+                                      <p class="next-editor-hint">
+                                        Please approve or reject all paragraph edits before proceeding to the next editor.
+                                      </p>
+                                    }
+                                  </div>
+                                }
+                              </div>
+                            } @else {
+                              <!-- Non-sequential mode: Show only Generate Final Output -->
+                              <div class="tl-final-output-container">
+                                <button
+                                  class="tl-final-output-btn"
+                                  type="button"
+                                  [disabled]="getParagraphEditsGeneratingState(message) || !editWorkflowService.allParagraphsDecided"
+                                  (click)="onGenerateFinalArticle(message)">
+                                  @if (getParagraphEditsGeneratingState(message)) {
+                                    <span class="spinner small"></span>
+                                  }
+                                  {{ getParagraphEditsGeneratingState(message) ? 'Generating...' : 'Run Final Output' }}
+                                </button>
+                                @if (!editWorkflowService.allParagraphsDecided) {
+                                  <p class="final-output-hint">
+                                    Please approve or reject all paragraph edits and feedback to generate the final article.
+                                  </p>
+                                }
+                              </div>
+                            }
+                          }
+                        }
+                        <!-- Action Buttons (for interactive options like content type selection) -->
+                        @if (message.actionButtons && message.actionButtons.length > 0) {
+                          <div class="action-buttons-container">
+                            @for (button of message.actionButtons; track button) {
+                              <button
+                                class="action-option-btn"
+                                (click)="onActionButtonClick(button.action)"
+                                type="button">
+                                {{ button.label }}
+                              </button>
+                            }
+                          </div>
+                        }
+                        <!-- Download and Preview Actions (for non-TL messages) -->
+                        @if (
+                          !shouldShowTLActions(message) && (
+                          message.downloadUrl ||
+                          message.previewUrl ||
+                          (message.role === 'assistant' && message.content && !draftWorkflowService.isActive) ||
+                          (draftWorkflowService.isActive && isDraftWorkflowFileUploadVisible())
+                          )
+                          ) {
+                          <div
+                            class="message-actions"
+                            >
+                            <!-- Copy to Clipboard Button (for all assistant messages, but not for edit workflow steps) -->
+                            @if (message.role === 'assistant' && message.content && !message.editWorkflow) {
+                              <button
+                                class="action-btn copy-btn"
+                                (click)="copyToClipboard(message.content)"
+                                title="Copy to clipboard"
+                                >
+                                <svg
+                                  width="16"
+                                  height="16"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                  >
+                                  <rect
+                                    x="9"
+                                    y="9"
+                                    width="13"
+                                    height="13"
+                                    rx="2"
+                                    ry="2"
+                                  ></rect>
+                                  <path
+                                    d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"
+                                  ></path>
+                                </svg>
+                              </button>
+                            }
+                            <!-- Draft Workflow Upload Button (appears when outline/supporting doc steps are active) -->
+                            @if (draftWorkflowService.isActive && isDraftWorkflowFileUploadVisible(message)) {
+                              <input
+                                #draftUploadInput
+                                type="file"
+                                accept=".pdf,.doc,.docx,.txt,.md"
+                                style="display: none"
+                                (change)="onDraftUploadSelected(draftUploadInput.files)"
+                                />
+                                <button
+                                  class="action-btn upload-btn"
+                                  type="button"
+                                  (click)="draftUploadInput.click()"
+                                  title="Upload document"
+                                  >
+                                  Upload
+                                </button>
+                              }
+                              <!-- Regenerate Button (for all assistant messages, but not for edit workflow steps) -->
+                              @if (message.role === 'assistant' && message.content && !message.editWorkflow) {
+                                <button
+                                  class="action-btn regenerate-btn"
+                                  (click)="regenerateMessage(i)"
+                                  title="Regenerate response"
+                                  >
+                                  <svg
+                                    width="16"
+                                    height="16"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                    >
+                                    <path d="M23 4v6h-6"></path>
+                                    <path d="M1 20v-6h6"></path>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36M20.49 15a9 9 0 0 1-14.85 3.36"></path>
+                                  </svg>
+                                </button>
+                              }
+                              <!-- Word Export Button (for all assistant messages, but not for edit workflow steps) -->
+                              <!-- Commenting out Word button, To use for your particular feature put conditional checks in place -->
+                              <!-- <button
+                              class="action-btn word-btn"
+                              *ngIf="message.role === 'assistant' && message.content && !message.editWorkflow"
+                              (click)="downloadAsWord(message.content)"
+                              title="Download as Word document"
+                              >
+                              <svg
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                >
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                                <polyline points="14 2 14 8 20 8"></polyline>
+                                <line x1="16" y1="13" x2="8" y2="13"></line>
+                                <line x1="16" y1="17" x2="8" y2="17"></line>
+                                <polyline points="10 9 9 9 8 9"></polyline>
+                              </svg>
+                              Word
+                            </button> -->
+                            <!-- PDF Export Button (for all assistant messages, but not for edit workflow steps) -->
+                            <!-- Commenting out pdf button, To use for your particular feature put conditional checks in place -->
+                            <!-- <button
+                            class="action-btn pdf-btn"
+                            *ngIf="message.role === 'assistant' && message.content && !message.editWorkflow"
+                            (click)="downloadAsPDF(message.content)"
+                            title="Download as PDF"
+                            >
+                            <svg
+                              width="16"
+                              height="16"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              >
+                              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                              <polyline points="14 2 14 8 20 8"></polyline>
+                              <line x1="16" y1="13" x2="8" y2="13"></line>
+                              <line x1="16" y1="17" x2="8" y2="17"></line>
+                              <polyline points="10 9 9 9 8 9"></polyline>
+                            </svg>
+                            PDF
+                          </button> -->
+                          <!-- PPTX Downloads -->
+                          @if (
+                            message.downloadUrl &&
+                            message.downloadFilename?.endsWith('.pptx')
+                            ) {
+                            <button
+                              class="action-btn download-btn"
+                  (click)="
+                    downloadFile(
+                      message.downloadUrl!,
+                      message.downloadFilename!
+                    )
+                  "
+                              >
+                              <svg
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                >
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="7 10 12 15 17 10"></polyline>
+                                <line x1="12" y1="15" x2="12" y2="3"></line>
+                              </svg>
+                              Download PPTX
+                            </button>
+                          }
+                          <!-- Podcast Download - Half Width Buttons -->
+                          @if (
+                            message.downloadUrl &&
+                            message.downloadFilename?.endsWith('.mp3')
+                            ) {
+                            <div
+                              class="podcast-download-container"
+                              >
+                              <button
+                                class="action-btn copy-btn half-width"
+                                (click)="copyToClipboard(message.content)"
+                                title="Copy podcast script"
+                                >
+                                <svg
+                                  width="16"
+                                  height="16"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                  >
+                                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                                </svg>
+                                Copy Script
+                              </button>
+                              <button
+                                class="action-btn download-btn half-width"
+                    (click)="
+                      downloadFile(
+                        message.downloadUrl!,
+                        message.downloadFilename!
+                      )
+                    "
+                                title="Download podcast audio"
+                                >
+                                <svg
+                                  width="16"
+                                  height="16"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                  >
+                                  <path
+                                    d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"
+                                  ></path>
+                                  <polyline points="7 10 12 15 17 10"></polyline>
+                                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                                </svg>
+                                Download MP3
+                              </button>
+                            </div>
+                          }
+                          <!-- Generated Content Downloads with Format Options -->
+                          @if (
+                            message.downloadUrl &&
+                            !message.downloadFilename?.endsWith('.pptx') &&
+                            !message.downloadFilename?.endsWith('.mp3')
+                            ) {
+                            <div
+                              class="download-format-group"
+                              >
+                              <span class="download-label">Download as:</span>
+                              <button
+                                class="format-btn"
+                    (click)="
+                      downloadGeneratedDocument(
+                        'word',
+                        message.content,
+                        'document'
+                      )
+                    "
+                                title="Download as Word document"
+                                >
+                                <svg
+                                  width="14"
+                                  height="14"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                  >
+                                  <path
+                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                                  ></path>
+                                  <polyline points="14 2 14 8 20 8"></polyline>
+                                </svg>
+                                Word
+                              </button>
+                              <button
+                                class="format-btn"
+                    (click)="
+                      downloadGeneratedDocument(
+                        'txt',
+                        message.content,
+                        'document'
+                      )
+                    "
+                                title="Download as Text file"
+                                >
+                                <svg
+                                  width="14"
+                                  height="14"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                  >
+                                  <path
+                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                                  ></path>
+                                </svg>
+                                Text
+                              </button>
+                              <button
+                                class="format-btn"
+                    (click)="
+                      downloadGeneratedDocument(
+                        'pdf',
+                        message.content,
+                        'document'
+                      )
+                    "
+                                title="Download as PDF"
+                                >
+                                <svg
+                                  width="14"
+                                  height="14"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="2"
+                                  >
+                                  <path
+                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                                  ></path>
+                                  <polyline points="14 2 14 8 20 8"></polyline>
+                                  <line x1="9" y1="15" x2="15" y2="15"></line>
+                                </svg>
+                                PDF
+                              </button>
+                            </div>
+                          }
+                          @if (message.previewUrl) {
+                            <button
+                              class="action-btn preview-btn"
+                              (click)="previewFile(message.previewUrl!)"
+                              >
+                              <svg
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                >
+                                <path
+                                  d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"
+                                ></path>
+                                <circle cx="12" cy="12" r="3"></circle>
+                              </svg>
+                              Preview
+                            </button>
+                          }
+                        </div>
+                      }
+                    </div>
+                  </div>
+                </div>
+              }
+            </div>
+            <!-- Loading Indicator -->
+            @if (isLoading) {
+              <div
+                class="loading-indicator"
+                role="status"
+                aria-live="polite"
+                >
+                @if (currentAction) {
+                  <span class="loading-text">{{
+                    currentAction
+                  }}</span>
+                }
+                @if (!currentAction) {
+                  <span class="sr-only">Loading response...</span>
+                }
+              </div>
+            }
+            <!-- Canvas Editor (side-by-side within chat area) -->
+            <app-canvas-editor></app-canvas-editor>
+          </div>
+        }
+
+        <!-- Chat Input - Claude.ai Inspired (Always Visible) -->
+        <div class="chat-composer" [class.expanded]="isComposerExpanded">
+          <div class="composer-input-wrapper">
+            <div class="composer-tools">
+              <!-- Edit Content Document Upload (Thought Leadership mode) -->
+              @if (selectedFlow === 'thought-leadership') {
+                <button
+                  class="tool-btn"
+                  (click)="triggerEditDocumentUpload()"
+                  title="Upload document for editing (Word, PDF, Text, Markdown)"
+                  type="button"
+                  [disabled]="isLoading"
+                  >
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    >
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                    <polyline points="10 9 9 9 8 9"></polyline>
+                  </svg>
+                </button>
+              }
+              <!-- PPT Upload (DDC mode) -->
+              @if (selectedFlow === 'ppt') {
+                <button
+                  class="tool-btn"
+                  (click)="triggerReferenceUpload()"
+                  title="Attach PowerPoint file"
+                  type="button"
+                  >
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    >
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="17 8 12 3 7 8"></polyline>
+                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                  </svg>
+                </button>
+              }
+              <button
+                class="tool-btn mic-btn"
+                (click)="startVoiceInput()"
+                title="Voice input"
+                type="button"
+                [disabled]="isLoading"
+                >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  >
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                  <line x1="12" y1="19" x2="12" y2="23"></line>
+                  <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+              </button>
+              @if (false) {
+                <button class="tool-btn" title="Add link" type="button">
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    >
+                    <path
+                      d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"
+                    ></path>
+                    <path
+                      d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"
+                    ></path>
+                  </svg>
+                </button>
+              }
+              <!-- Collapse Button (visible when expanded) -->
+              @if (isComposerExpanded) {
+                <button
+                  class="tool-btn collapse-btn"
+                  (click)="collapseComposer()"
+                  title="Collapse input"
+                  type="button"
+                  >
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    >
+                    <polyline points="18 15 12 9 6 15"></polyline>
+                  </svg>
+                </button>
+              }
+            </div>
+            <textarea
+              #composerTextarea
+              [(ngModel)]="userInput"
+              (keydown.enter)="onEnterPress($event)"
+              (input)="onComposerInput($event)"
+              (focus)="onComposerFocus()"
+              placeholder="How can I help you today?"
+              rows="1"
+              class="composer-textarea"
+              aria-label="Message input"
+              [attr.aria-disabled]="isLoading || isAwaitingContent"
+              [disabled]="isAwaitingContent"
+              [readonly]="isAwaitingContent"
+              >
+            </textarea>
+            <button
+              class="send-btn-composer"
+              (click)="sendMessage()"
+              [disabled]="(!userInput.trim() && !uploadedEditDocumentFile && !uploadedPPTFile) || isLoading || (isAwaitingContent && !uploadedEditDocumentFile)"
+              type="button"
+              aria-label="Send message"
+              [attr.aria-busy]="isLoading"
+              >
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                >
+                <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+              </svg>
+            </button>
+          </div>
+
+          <!-- Uploaded Edit Document Display (Thought Leadership) -->
+          @if (uploadedEditDocumentFile && selectedFlow === 'thought-leadership') {
+            <div class="reference-doc-preview ppt-attachment">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                >
+                <path
+                  d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                ></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+              </svg>
+              <span>{{ uploadedEditDocumentFile.name }}</span>
+              <button class="remove-ref" (click)="removeUploadedEditDocument()" type="button">
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  >
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            </div>
+          }
+
+          <!-- Uploaded PPT Display -->
+          @if (uploadedPPTFile && selectedFlow === 'ppt') {
+            <div class="reference-doc-preview ppt-attachment">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                >
+                <path
+                  d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"
+                ></path>
+                <polyline points="13 2 13 9 20 9"></polyline>
+              </svg>
+              <span>{{ uploadedPPTFile.name }}</span>
+              <button class="remove-ref" (click)="removeUploadedPPT()" type="button">
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  >
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            </div>
+          }
+        </div>
+      </main>
+
+      <!-- Guided Journey Dialog -->
+      @if (showGuidedDialog) {
+        <div
+          class="dialog-overlay"
+          >
+          <div class="dialog-container" (click)="$event.stopPropagation()">
+            <div class="dialog-header">
+              <h2>
+                {{
+                selectedFlow === "ppt"
+                ? "Create Presentation"
+                : "Ideation-to-Publication"
+                }}
+              </h2>
+              <button
+                class="close-dialog-btn"
+                (click)="closeGuidedDialog()"
+                type="button"
+                >
+                <svg
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  >
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            </div>
+            <div class="dialog-content">
+              <!-- PPT Forms -->
+              @if (selectedFlow === 'ppt') {
+                <div>
+                  <div class="form-tabs">
+                    <button
+                      class="tab-btn"
+                      [class.active]="selectedPPTOperation === 'draft'"
+                      (click)="selectedPPTOperation = 'draft'"
+                      >
+                      Draft
+                    </button>
+                    <button
+                      class="tab-btn"
+                      [class.active]="selectedPPTOperation === 'improve'"
+                      (click)="selectedPPTOperation = 'improve'"
+                      >
+                      Improve
+                    </button>
+                    <button
+                      class="tab-btn"
+                      [class.active]="selectedPPTOperation === 'sanitize'"
+                      (click)="selectedPPTOperation = 'sanitize'"
+                      >
+                      Sanitize
+                    </button>
+                    <button
+                      class="tab-btn"
+                      [class.active]="selectedPPTOperation === 'bestPractices'"
+                      (click)="selectedPPTOperation = 'bestPractices'"
+                      >
+                      Best Practices
+                    </button>
+                  </div>
+                  @if (selectedPPTOperation === 'draft') {
+                    <div class="form-content">
+                      <div class="form-field">
+                        <label>Topic *</label>
+                        <input
+                          type="text"
+                          [(ngModel)]="draftData.topic"
+                          placeholder="e.g., Digital Transformation Strategy"
+                          aria-required="true"
+                          [class.error]="!draftData.topic && draftData.topic !== ''"
+                          />
+                          @if (!draftData.topic && draftData.topic !== '') {
+                            <small
+                              class="error-text"
+                              >Topic is required</small
+                              >
+                          }
+                        </div>
+                        <div class="form-field">
+                          <label>Objective *</label>
+                          <input
+                            type="text"
+                            [(ngModel)]="draftData.objective"
+                            placeholder="e.g., Secure board approval"
+                            aria-required="true"
+                [class.error]="
+                  !draftData.objective && draftData.objective !== ''
+                "
+                            />
+                            @if (!draftData.objective && draftData.objective !== '') {
+                              <small
+                                class="error-text"
+                                >Objective is required</small
+                                >
+                            }
+                          </div>
+                          <div class="form-field">
+                            <label>Target Audience *</label>
+                            <input
+                              type="text"
+                              [(ngModel)]="draftData.audience"
+                              placeholder="e.g., C-Suite executives"
+                              aria-required="true"
+                              [class.error]="!draftData.audience && draftData.audience !== ''"
+                              />
+                              @if (!draftData.audience && draftData.audience !== '') {
+                                <small
+                                  class="error-text"
+                                  >Target Audience is required</small
+                                  >
+                              }
+                            </div>
+                            <div class="form-field">
+                              <label>Additional Context</label>
+                              <textarea
+                                [(ngModel)]="draftData.additional_context"
+                                rows="3"
+                                placeholder="Any specific requirements..."
+                              ></textarea>
+                            </div>
+                            <div class="form-field">
+                              <label>Reference Document (Optional)</label>
+                              <input
+                                type="file"
+                                accept=".pdf,.docx,.pptx,.txt"
+                                (change)="onReferenceDocumentSelected($event)"
+                                class="file-input"
+                                />
+                                <small class="help-text"
+                                  >Upload a reference document to include its content in the final
+                                  output</small
+                                  >
+                                </div>
+                                <div class="form-field">
+                                  <label>Reference Link (Optional)</label>
+                                  <input
+                                    type="url"
+                                    [(ngModel)]="draftData.reference_link"
+                                    placeholder="https://example.com/reference"
+                                    />
+                                    <small class="help-text"
+                                      >Provide a link to reference content</small
+                                      >
+                                    </div>
+                                    <button
+                                      class="submit-btn"
+                                      (click)="createDraft(); closeGuidedDialog()"
+              [disabled]="
+                !draftData.topic ||
+                !draftData.objective ||
+                !draftData.audience ||
+                isLoading
+              "
+                                      >
+                                      Generate Presentation
+                                    </button>
+                                  </div>
+                                }
+                                @if (selectedPPTOperation === 'improve') {
+                                  <div class="form-content">
+                                    <div class="form-field">
+                                      <label>Original PowerPoint *</label>
+                                      <div class="file-upload-area">
+                                        <input
+                                          type="file"
+                                          accept=".pptx"
+                                          (change)="onOriginalFileSelected($event)"
+                                          id="original-file"
+                                          class="file-input-hidden"
+                                          />
+                                          <label for="original-file" class="file-upload-label">
+                                            <svg
+                                              width="24"
+                                              height="24"
+                                              viewBox="0 0 24 24"
+                                              fill="none"
+                                              stroke="currentColor"
+                                              stroke-width="2"
+                                              >
+                                              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                              <polyline points="17 8 12 3 7 8"></polyline>
+                                              <line x1="12" y1="3" x2="12" y2="15"></line>
+                                            </svg>
+                                            @if (!originalPPTFile) {
+                                              <span>Upload file</span>
+                                            }
+                                            @if (originalPPTFile) {
+                                              <span class="file-name"
+                                                >✓ {{ originalPPTFile.name }}</span
+                                                >
+                                            }
+                                          </label>
+                                        </div>
+                                      </div>
+                                      <div class="form-field">
+                                        <label>Reference PowerPoint (optional)</label>
+                                        <div class="file-upload-area">
+                                          <input
+                                            type="file"
+                                            accept=".pptx"
+                                            (change)="onReferenceFileSelected($event)"
+                                            id="reference-file"
+                                            class="file-input-hidden"
+                                            />
+                                            <label for="reference-file" class="file-upload-label">
+                                              <svg
+                                                width="24"
+                                                height="24"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                stroke-width="2"
+                                                >
+                                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                                <polyline points="17 8 12 3 7 8"></polyline>
+                                                <line x1="12" y1="3" x2="12" y2="15"></line>
+                                              </svg>
+                                              @if (!referencePPTFile) {
+                                                <span>Upload file</span>
+                                              }
+                                              @if (referencePPTFile) {
+                                                <span class="file-name"
+                                                  >✓ {{ referencePPTFile.name }}</span
+                                                  >
+                                              }
+                                            </label>
+                                          </div>
+                                        </div>
+                                        <button
+                                          class="submit-btn"
+                                          (click)="improvePPT(); closeGuidedDialog()"
+                                          [disabled]="!originalPPTFile || isLoading"
+                                          >
+                                          Improve Presentation
+                                        </button>
+                                      </div>
+                                    }
+                                    @if (selectedPPTOperation === 'sanitize') {
+                                      <div class="form-content">
+                                        <div class="form-field">
+                                          <label>PowerPoint File *</label>
+                                          <div class="file-upload-area">
+                                            <input
+                                              type="file"
+                                              accept=".pptx"
+                                              (change)="onSanitizeFileSelected($event)"
+                                              id="sanitize-file"
+                                              class="file-input-hidden"
+                                              />
+                                              <label for="sanitize-file" class="file-upload-label">
+                                                <svg
+                                                  width="24"
+                                                  height="24"
+                                                  viewBox="0 0 24 24"
+                                                  fill="none"
+                                                  stroke="currentColor"
+                                                  stroke-width="2"
+                                                  >
+                                                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                                  <polyline points="17 8 12 3 7 8"></polyline>
+                                                  <line x1="12" y1="3" x2="12" y2="15"></line>
+                                                </svg>
+                                                @if (!sanitizePPTFile) {
+                                                  <span>Upload file</span>
+                                                }
+                                                @if (sanitizePPTFile) {
+                                                  <span class="file-name"
+                                                    >✓ {{ sanitizePPTFile.name }}</span
+                                                    >
+                                                }
+                                              </label>
+                                            </div>
+                                          </div>
+                                          <div class="form-field">
+                                            <label>Client Name (optional)</label>
+                                            <input
+                                              type="text"
+                                              [(ngModel)]="sanitizeData.clientName"
+                                              placeholder="e.g., Adobe Inc"
+                                              />
+                                            </div>
+                                            <div class="form-field">
+                                              <label>Product Names (optional)</label>
+                                              <input
+                                                type="text"
+                                                [(ngModel)]="sanitizeData.products"
+                                                placeholder="e.g., Photoshop, Creative Cloud"
+                                                />
+                                              </div>
+                                              <div class="form-field">
+                                                <label style="margin-bottom: 12px; display: block"
+                                                  >Sanitization Options</label
+                                                  >
+                                                  <div class="checkbox-group">
+                                                    <label class="checkbox-label">
+                                                      <input
+                                                        type="checkbox"
+                                                        [(ngModel)]="sanitizeData.options.numericData"
+                                                        />
+                                                        <span>Numeric Data (currency, percentages, FTEs)</span>
+                                                      </label>
+                                                      <label class="checkbox-label">
+                                                        <input
+                                                          type="checkbox"
+                                                          [(ngModel)]="sanitizeData.options.personalInfo"
+                                                          />
+                                                          <span
+                                                            >Personal Information (emails, phones, SSN, IP
+                                                            addresses)</span
+                                                            >
+                                                          </label>
+                                                          <label class="checkbox-label">
+                                                            <input
+                                                              type="checkbox"
+                                                              [(ngModel)]="sanitizeData.options.financialData"
+                                                              />
+                                                              <span
+                                                                >Financial Data (credit cards, bank accounts, tax IDs)</span
+                                                                >
+                                                              </label>
+                                                              <label class="checkbox-label">
+                                                                <input
+                                                                  type="checkbox"
+                                                                  [(ngModel)]="sanitizeData.options.locations"
+                                                                  />
+                                                                  <span>Locations (addresses, cities, states, zip codes)</span>
+                                                                </label>
+                                                                <label class="checkbox-label">
+                                                                  <input
+                                                                    type="checkbox"
+                                                                    [(ngModel)]="sanitizeData.options.identifiers"
+                                                                    />
+                                                                    <span
+                                                                      >Business Identifiers (project IDs, deal codes,
+                                                                      invoices)</span
+                                                                      >
+                                                                    </label>
+                                                                    <label class="checkbox-label">
+                                                                      <input
+                                                                        type="checkbox"
+                                                                        [(ngModel)]="sanitizeData.options.names"
+                                                                        />
+                                                                        <span>Client & Product Names</span>
+                                                                      </label>
+                                                                      <label class="checkbox-label">
+                                                                        <input
+                                                                          type="checkbox"
+                                                                          [(ngModel)]="sanitizeData.options.logos"
+                                                                          />
+                                                                          <span>Logos & Watermarks</span>
+                                                                        </label>
+                                                                        <label class="checkbox-label">
+                                                                          <input
+                                                                            type="checkbox"
+                                                                            [(ngModel)]="sanitizeData.options.metadata"
+                                                                            />
+                                                                            <span>Metadata & Speaker Notes</span>
+                                                                          </label>
+                                                                          <label class="checkbox-label">
+                                                                            <input
+                                                                              type="checkbox"
+                                                                              [(ngModel)]="sanitizeData.options.llmDetection"
+                                                                              />
+                                                                              <span
+                                                                                >AI-Powered Detection (company names, person names,
+                                                                                cities)</span
+                                                                                >
+                                                                              </label>
+                                                                              <label class="checkbox-label">
+                                                                                <input
+                                                                                  type="checkbox"
+                                                                                  [(ngModel)]="sanitizeData.options.hyperlinks"
+                                                                                  />
+                                                                                  <span>Hyperlinks (remove all hyperlinks from shapes)</span>
+                                                                                </label>
+                                                                                <label class="checkbox-label">
+                                                                                  <input
+                                                                                    type="checkbox"
+                                                                                    [(ngModel)]="sanitizeData.options.embeddedObjects"
+                                                                                    />
+                                                                                    <span>Embedded Objects (Excel, Word, PDF files)</span>
+                                                                                  </label>
+                                                                                </div>
+                                                                              </div>
+                                                                              <button
+                                                                                class="submit-btn"
+                                                                                (click)="sanitizePPT(); closeGuidedDialog()"
+                                                                                [disabled]="!sanitizePPTFile || isLoading"
+                                                                                >
+                                                                                Sanitize Presentation
+                                                                              </button>
+                                                                            </div>
+                                                                          }
+                                                                          @if (selectedPPTOperation === 'bestPractices') {
+                                                                            <div
+                                                                              class="form-content"
+                                                                              >
+                                                                              <div class="form-field">
+                                                                                <label>PowerPoint File *</label>
+                                                                                <div class="file-upload-area">
+                                                                                  <input
+                                                                                    type="file"
+                                                                                    accept=".pptx"
+                                                                                    (change)="onBestPracticesFileSelected($event)"
+                                                                                    id="best-practices-file"
+                                                                                    class="file-input-hidden"
+                                                                                    />
+                                                                                    <label for="best-practices-file" class="file-upload-label">
+                                                                                      <svg
+                                                                                        width="24"
+                                                                                        height="24"
+                                                                                        viewBox="0 0 24 24"
+                                                                                        fill="none"
+                                                                                        stroke="currentColor"
+                                                                                        stroke-width="2"
+                                                                                        >
+                                                                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                                                                        <polyline points="17 8 12 3 7 8"></polyline>
+                                                                                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                                                                                      </svg>
+                                                                                      @if (!bestPracticesPPTFile) {
+                                                                                        <span>Upload file</span>
+                                                                                      }
+                                                                                      @if (bestPracticesPPTFile) {
+                                                                                        <span class="file-name"
+                                                                                          >✓ {{ bestPracticesPPTFile.name }}</span
+                                                                                          >
+                                                                                      }
+                                                                                    </label>
+                                                                                  </div>
+                                                                                </div>
+                                                                                <div class="form-field">
+                                                                                  <label style="margin-bottom: 12px; display: block"
+                                                                                    >Validation Categories</label
+                                                                                    >
+                                                                                    <div class="checkbox-group">
+                                                                                      <label class="checkbox-label">
+                                                                                        <input
+                                                                                          type="checkbox"
+                                                                                          [(ngModel)]="bestPracticesData.categories.structure"
+                                                                                          />
+                                                                                          <span>Structure (MECE framework, logical flow)</span>
+                                                                                        </label>
+                                                                                        <label class="checkbox-label">
+                                                                                          <input
+                                                                                            type="checkbox"
+                                                                                            [(ngModel)]="bestPracticesData.categories.visuals"
+                                                                                            />
+                                                                                            <span>Visuals (Image quality, relevance, placement)</span>
+                                                                                          </label>
+                                                                                          <label class="checkbox-label">
+                                                                                            <input
+                                                                                              type="checkbox"
+                                                                                              [(ngModel)]="bestPracticesData.categories.design"
+                                                                                              />
+                                                                                              <span>Design (Color scheme, fonts, spacing)</span>
+                                                                                            </label>
+                                                                                            <label class="checkbox-label">
+                                                                                              <input
+                                                                                                type="checkbox"
+                                                                                                [(ngModel)]="bestPracticesData.categories.charts"
+                                                                                                />
+                                                                                                <span>Charts (Data visualization, clarity, labels)</span>
+                                                                                              </label>
+                                                                                              <label class="checkbox-label">
+                                                                                                <input
+                                                                                                  type="checkbox"
+                                                                                                  [(ngModel)]="bestPracticesData.categories.formatting"
+                                                                                                  />
+                                                                                                  <span>Formatting (Consistency, alignment, text size)</span>
+                                                                                                </label>
+                                                                                                <label class="checkbox-label">
+                                                                                                  <input
+                                                                                                    type="checkbox"
+                                                                                                    [(ngModel)]="bestPracticesData.categories.content"
+                                                                                                    />
+                                                                                                    <span>Content (Clarity, conciseness, grammar)</span>
+                                                                                                  </label>
+                                                                                                </div>
+                                                                                              </div>
+                                                                                              <button
+                                                                                                class="submit-btn"
+                                                                                                (click)="submitBestPracticesForm()"
+                                                                                                [disabled]="!bestPracticesPPTFile || isLoading"
+                                                                                                >
+                                                                                                Validate Best Practices
+                                                                                              </button>
+                                                                                            </div>
+                                                                                          }
+                                                                                        </div>
+                                                                                      }
+                                                                                      <!-- Thought Leadership Action Cards -->
+                                                                                      @if (selectedFlow === 'thought-leadership') {
+                                                                                        <div>
+                                                                                          <p class="tl-intro-text">Choose a workflow to create, refine, or translate your content:</p>
+                                                                                          <div class="tl-action-cards-grid">
+                                                                                            <button class="tl-action-card" (click)="onTLActionCardClick('draft-content')">
+                                                                                              <div class="tl-card-icon">✍️</div>
+                                                                                              <h3>Draft Content</h3>
+                                                                                              <p>Create articles, white papers, executive briefs, and blogs with AI-guided strategic analysis.</p>
+                                                                                            </button>
+                                                                                            <button class="tl-action-card" (click)="onTLActionCardClick('conduct-research')">
+                                                                                              <div class="tl-card-icon">🔍</div>
+                                                                                              <h3>Market Intelligence & Insights</h3>
+                                                                                              <p>Synthesize insights from multiple sources with citations and executive summaries.</p>
+                                                                                            </button>
+                                                                                            <button class="tl-action-card" (click)="onTLActionCardClick('edit-content')">
+                                                                                              <div class="tl-card-icon">✏️</div>
+                                                                                              <h3>Edit Content</h3>
+                                                                                              <p>Apply specialized editing with Brand Alignment, Copy, Line, Content, or Development Editors.</p>
+                                                                                            </button>
+                                                                                            <button class="tl-action-card" (click)="onTLActionCardClick('refine-content')">
+                                                                                              <div class="tl-card-icon">⚡</div>
+                                                                                              <h3>Refine Content</h3>
+                                                                                              <p>Expand, compress, adjust tone, enhance research, or get improvement suggestions.</p>
+                                                                                            </button>
+                                                                                            <button class="tl-action-card" (click)="onTLActionCardClick('format-translator')">
+                                                                                              <div class="tl-card-icon">🔄</div>
+                                                                                              <h3>Format Translator</h3>
+                                                                                              <p>Convert content between formats while maintaining strategic messaging and tone.</p>
+                                                                                            </button>
+                                                                                          </div>
+                                                                                        </div>
+                                                                                      }
+                                                                                      <!-- Market Intelligence Action Cards -->
+                                                                                      @if (selectedFlow === 'market-intelligence') {
+                                                                                        <div>
+                                                                                          <p class="mi-intro-text">Choose a workflow to research, analyze, and develop your market intelligence content:</p>
+                                                                                          <div class="mi-action-cards-grid">
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('draft-content')">
+                                                                                              <div class="mi-card-icon">📝</div>
+                                                                                              <h3>Draft Content</h3>
+                                                                                              <p>Generate market research articles, reports, and briefs powered by AI strategic analysis.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('conduct-research')">
+                                                                                              <div class="mi-card-icon">🔬</div>
+                                                                                              <h3>Conduct Research</h3>
+                                                                                              <p>Gather and synthesize market insights from trusted sources with executive summaries.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('edit-content')">
+                                                                                              <div class="mi-card-icon">📋</div>
+                                                                                              <h3>Edit Content</h3>
+                                                                                              <p>Refine and polish your market analysis with professional editing standards.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('refine-content')">
+                                                                                              <div class="mi-card-icon">✨</div>
+                                                                                              <h3>Refine Content</h3>
+                                                                                              <p>Enhance depth, adjust perspectives, or get strategic improvement suggestions.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('format-translator')">
+                                                                                              <div class="mi-card-icon">🔀</div>
+                                                                                              <h3>Format Translator</h3>
+                                                                                              <p>Convert research between formats while preserving key insights and analysis.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('generate-podcast')">
+                                                                                              <div class="mi-card-icon">🎙️</div>
+                                                                                              <h3>Generate Podcast</h3>
+                                                                                              <p>Transform market research into engaging podcast scripts for audio distribution.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('brand-format')">
+                                                                                              <div class="mi-card-icon">🎨</div>
+                                                                                              <h3>Brand Format</h3>
+                                                                                              <p>Apply PwC branding standards and visual formatting to your market analysis.</p>
+                                                                                            </button>
+                                                                                            <button class="mi-action-card" (click)="onMIActionCardClick('professional-polish')">
+                                                                                              <div class="mi-card-icon">⭐</div>
+                                                                                              <h3>Professional Polish</h3>
+                                                                                              <p>Apply premium editing and refinement for executive-level market intelligence.</p>
+                                                                                            </button>
+                                                                                          </div>
+                                                                                        </div>
+                                                                                      }
+                                                                                    </div>
+                                                                                  </div>
+                                                                                </div>
+                                                                              }
+                                                                            </div>
+
+                                                                            <!-- Thought Leadership Guided Flow Components -->
+                                                                            <app-draft-content-flow></app-draft-content-flow>
+                                                                            <app-conduct-research-flow></app-conduct-research-flow>
+                                                                            <app-edit-content-flow></app-edit-content-flow>
+                                                                            <app-refine-content-flow
+                                                                              (contentGenerated)="onRefinedContentGenerated($event)"
+                                                                              (streamToChat)="onRefineContentStreamToChat($event)">
+                                                                            </app-refine-content-flow>
+                                                                            <app-format-translator-flow></app-format-translator-flow>
+
+                                                                            <!-- Market Intelligence Guided Flow Components -->
+                                                                            <app-mi-draft-content-flow></app-mi-draft-content-flow>
+                                                                            <app-mi-conduct-research-flow></app-mi-conduct-research-flow>
+                                                                            <app-mi-edit-content-flow></app-mi-edit-content-flow>
+                                                                            <app-mi-refine-content-flow></app-mi-refine-content-flow>
+                                                                            <app-mi-format-translator-flow></app-mi-format-translator-flow>
+                                                                            <app-mi-generate-podcast-flow></app-mi-generate-podcast-flow>
+                                                                            <app-mi-brand-format-flow></app-mi-brand-format-flow>
+                                                                            <app-mi-professional-polish-flow></app-mi-professional-polish-flow>
+
+                                                                            <!-- DDC Guided Dialog and Flow Components -->
+                                                                            <app-guided-dialog
+                                                                              [isOpen]="showDdcGuidedDialog"
+                                                                              journeyType="ddc"
+                                                                              [workflows]="ddcWorkflows"
+                                                                              (workflowSelected)="onWorkflowSelected($event)"
+                                                                              (close)="closeDdcGuidedDialog()">
+                                                                            </app-guided-dialog>
+
+                                                                            <!-- Quick Draft Dialog -->
+                                                                            <app-quick-draft-dialog
+                                                                              [isOpen]="showQuickDraftDialog"
+                                                                              [topic]="quickDraftTopic"
+                                                                              [contentType]="quickDraftContentType"
+                                                                              (close)="closeQuickDraftDialog()"
+                                                                              (submit)="onQuickDraftSubmit($event)">
+                                                                            </app-quick-draft-dialog>
+
+                                                                            <app-brand-format-flow></app-brand-format-flow>
+                                                                            <app-professional-polish-flow></app-professional-polish-flow>
+                                                                            <app-sanitization-flow
+                                                                              [hideBackButton]="workflowOpenedFrom === 'quick-action'"
+                                                                              [openedFrom]="workflowOpenedFrom">
+                                                                            </app-sanitization-flow>
+                                                                            <app-client-customization-flow></app-client-customization-flow>
+                                                                            <app-rfp-response-flow></app-rfp-response-flow>
+                                                                            <app-ddc-format-translator-flow></app-ddc-format-translator-flow>
+                                                                            <app-slide-creation-flow
+                                                                              [hideBackButton]="workflowOpenedFrom === 'quick-action'"
+                                                                              [openedFrom]="workflowOpenedFrom">
+                                                                            </app-slide-creation-flow>
+
+                                                                            <!-- Voice Input Modal -->
+                                                                            <app-voice-input
+                                                                              (transcriptChange)="onVoiceTranscriptChange($event)"
+                                                                              (listeningChange)="onVoiceListeningChange($event)"
+                                                                            ></app-voice-input>
